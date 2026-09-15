@@ -743,6 +743,11 @@ class vLLMHttpServer:
                 extra_fields=extra_fields,
             )
 
+        # Direct engine clients bypass the OpenAI serving layer's error check.
+        # Preserve its failure semantics instead of returning an empty completion.
+        if final_res.outputs[0].finish_reason == "error":
+            raise RuntimeError(f"vLLM request {request_id} failed during generation")
+
         # Prefix-cache hit count for this request; consumers surface it as
         # OpenAI usage.prompt_tokens_details.cached_tokens.
         extra_fields["num_cached_tokens"] = getattr(final_res, "num_cached_tokens", None)

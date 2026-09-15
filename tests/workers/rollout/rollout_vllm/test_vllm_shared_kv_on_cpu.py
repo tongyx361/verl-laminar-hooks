@@ -61,6 +61,32 @@ def test_generate_passes_cache_namespace_with_multimodal_prompt(cache_salt: str 
     assert server._admitting == 0
 
 
+@pytest.mark.parametrize("token_ids", [[], [7, 8]])
+def test_generate_raises_for_engine_error_instead_of_returning_a_completion(token_ids: list[int]) -> None:
+    server = object.__new__(vLLMHttpServer)
+    server._disaggregation_role = None
+    server.config = OmegaConf.create({"max_model_len": 16, "full_determinism": False})
+    server.model_config = SimpleNamespace(processor=None, lora_rank=0, lora={})
+    server._submission_paused = False
+    server._admitting = 0
+    server.replica_rank = 0
+    server.global_steps = 0
+
+    async def generate(**kwargs):
+        yield SimpleNamespace(outputs=[SimpleNamespace(finish_reason="error", token_ids=token_ids, logprobs=None)])
+
+    server.engine = SimpleNamespace(generate=Mock(side_effect=generate))
+    with pytest.raises(RuntimeError, match="vLLM request request-error failed during generation"):
+        asyncio.run(
+            server.generate(
+                prompt_ids=[1, 2, 3],
+                sampling_params={"max_tokens": 4, "logprobs": True},
+                request_id="request-error",
+            )
+        )
+    assert server._admitting == 0
+
+
 @pytest.mark.parametrize("reset_connector", [True, False])
 def test_clear_kv_cache_can_preserve_shared_connector(reset_connector):
     server = object.__new__(vLLMHttpServer)
