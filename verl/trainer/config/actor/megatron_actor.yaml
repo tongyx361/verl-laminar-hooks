@@ -22,6 +22,10 @@ checkpoint:
   # Target dataclass for this configuration
   _target_: verl.workers.config.McoreCheckpointConfig
 
+  # Opt in only when safetensors allocation calls fail on the destination filesystem.
+  # Writes each HF shard to /tmp before copying; direct writes remain the default.
+  safetensors_staging: False
+
   # Mbridge config extension.
   # when vanilla_mbridge=True, and your filesystem is a distributed filesystem,(which means you write a file in node A
   # and you can read the file in node B immediately)

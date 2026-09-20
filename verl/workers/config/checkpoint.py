@@ -39,6 +39,9 @@ class McoreCheckpointConfig(CheckpointConfig):
     when it forwards kwargs to ``bridge.save_weights()``.
 
     Args:
+        safetensors_staging (bool): Stage HF shards under /tmp before copying to
+            the destination for filesystems incompatible with safetensors >= 0.8
+            allocation calls. Defaults to False (direct writes).
         mbridge_config (dict[str, Any]): Extra kwargs forwarded to
             ``bridge.save_weights``. Typical keys include
             ``distributed_filesystem`` and ``memory_efficient`` for the
@@ -46,4 +49,5 @@ class McoreCheckpointConfig(CheckpointConfig):
             bridge's ``save_weights`` signature are silently ignored.
     """
 
+    safetensors_staging: bool = False
     mbridge_config: dict[str, Any] = field(default_factory=dict)
