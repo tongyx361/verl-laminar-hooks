@@ -655,3 +655,28 @@ class TestModelShardedStateDictNotBuiltUnnecessarily:
 
         mgr.load_checkpoint(ckpt_path)
         mgr.model[0].sharded_state_dict.assert_called_once()
+
+
+def test_copy_file_replace_is_atomic_and_cleans_temp(tmp_path):
+    from verl.utils.checkpoint.megatron_checkpoint_manager import _copy_file_replace
+
+    src = tmp_path / "src.bin"
+    dest = tmp_path / "dest.bin"
+    src.write_bytes(b"payload")
+
+    _copy_file_replace(str(src), str(dest))
+
+    assert dest.read_bytes() == b"payload"
+    assert not (tmp_path / "dest.bin.tmp").exists()
+
+
+def test_safetensors_staging_root_treats_blank_as_disabled():
+    from types import SimpleNamespace
+
+    from verl.utils.checkpoint.megatron_checkpoint_manager import _safetensors_staging_root
+
+    assert _safetensors_staging_root(SimpleNamespace()) is None
+    assert _safetensors_staging_root(SimpleNamespace(safetensors_staging_dir=None)) is None
+    assert _safetensors_staging_root(SimpleNamespace(safetensors_staging_dir="")) is None
+    assert _safetensors_staging_root(SimpleNamespace(safetensors_staging_dir="  ")) is None
+    assert _safetensors_staging_root(SimpleNamespace(safetensors_staging_dir="/scratch/hf")) == "/scratch/hf"

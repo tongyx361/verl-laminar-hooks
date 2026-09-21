@@ -35,31 +35,6 @@ logger = logging.getLogger(__file__)
 # excluding calls to generate method.
 CONTROL_METHOD_CONCURRENCY = 16
 
-_STANDALONE_MASTER_PORT_BASE = 20000
-_STANDALONE_MASTER_PORT_STRIDE = 32
-_STANDALONE_MASTER_PORT_ROLE_OFFSETS = {
-    "rollout": 0,
-    "reward": 512,
-    "teacher": 1024,
-}
-_MAX_TCP_PORT = 65535
-
-
-def _get_standalone_master_port_range(replica_rank: int, role: str) -> list[int]:
-    """Return a disjoint TCPStore port range for one standalone worker group."""
-    if replica_rank < 0 or role not in _STANDALONE_MASTER_PORT_ROLE_OFFSETS:
-        raise ValueError(f"Invalid standalone rollout rank or role: replica_rank={replica_rank}, role={role!r}")
-
-    range_index = replica_rank + _STANDALONE_MASTER_PORT_ROLE_OFFSETS[role]
-    start = _STANDALONE_MASTER_PORT_BASE + range_index * _STANDALONE_MASTER_PORT_STRIDE
-    end = start + _STANDALONE_MASTER_PORT_STRIDE
-    if end - 1 > _MAX_TCP_PORT:
-        raise ValueError(
-            f"Standalone rollout master port range exceeds TCP range: "
-            f"replica_rank={replica_rank}, role={role!r}, start={start}, end={end}"
-        )
-    return [start, end]
-
 
 class TokenOutput(BaseModel):
     token_ids: list[int]
@@ -247,14 +222,6 @@ class RolloutReplica(ABC):
             name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
         else:
             name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
-        role = "reward" if self.is_reward_model else "teacher" if self.is_teacher_model else "rollout"
-        master_port_range = _get_standalone_master_port_range(self.replica_rank, role)
-        logger.info(
-            "Using standalone rollout master_port_range=%s for replica_rank=%s role=%s",
-            master_port_range,
-            self.replica_rank,
-            role,
-        )
         worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
@@ -262,7 +229,6 @@ class RolloutReplica(ABC):
             name_prefix=name_prefix,
             use_gpu=True,
             device_name=get_device_name(),
-            master_port_range=master_port_range,
         )
         self.workers = worker_group.workers
         await self.launch_servers()

@@ -44,6 +44,13 @@ class _FakeEngine:
         self.pause_calls = 0
         self.resume_calls = 0
         self.admitting_at_pause = None
+        self.abort_calls = []
+        self.drain_calls = 0
+        self.reset_prefix_calls = 0
+        self.reset_mm_calls = 0
+        self.reset_encoder_calls = 0
+        self.reset_prefix_cache_result = True
+        self.logger_manager = object()
 
     async def pause_generation(self, **kwargs):
         self.pause_calls += 1
@@ -51,6 +58,22 @@ class _FakeEngine:
 
     async def resume_generation(self):
         self.resume_calls += 1
+
+    async def abort(self, request_ids, internal=True):
+        self.abort_calls.append(list(request_ids))
+
+    async def wait_for_requests_to_drain(self):
+        self.drain_calls += 1
+
+    async def reset_prefix_cache(self, reset_connector=True):
+        self.reset_prefix_calls += 1
+        return self.reset_prefix_cache_result
+
+    async def reset_mm_cache(self):
+        self.reset_mm_calls += 1
+
+    async def reset_encoder_cache(self):
+        self.reset_encoder_calls += 1
 
 
 def _make_server(node_rank: int = 0):
@@ -201,3 +224,78 @@ def test_barrier_times_out_instead_of_hanging(monkeypatch):
         assert server.engine.pause_calls == 1, "barrier must proceed rather than deadlock"
 
     asyncio.run(main())
+
+
+def test_clear_kv_cache_does_not_fail_when_prefix_reset_returns_false():
+    async def main():
+        server = _make_server()
+        server.engine.reset_prefix_cache_result = False
+
+        await server.clear_kv_cache()
+
+        assert server.engine.reset_prefix_calls == 1
+        assert server.engine.reset_mm_calls == 1
+        assert server.engine.reset_encoder_calls == 1
+
+    asyncio.run(main())
+
+
+def test_pause_generation_false_aborts_then_drains_before_cache_reset():
+    async def main():
+        server = _make_server()
+        server.engine.output_processor.request_states = {"r1": object(), "r2": object()}
+
+        result = await server.abort_all_requests(pause_generation=False)
+
+        assert server._submission_paused is False
+        assert server.engine.pause_calls == 0
+        assert server.engine.abort_calls == [["r1", "r2"]]
+        assert server.engine.drain_calls == 1
+        assert server.engine.reset_prefix_calls == 1
+        assert result["aborted_count"] == 2
+
+    asyncio.run(main())
+
+
+def test_pause_generation_false_rejects_reject_request():
+    async def main():
+        server = _make_server()
+        with pytest.raises(ValueError, match="reject_request=True requires pause_generation=True"):
+            await server.abort_all_requests(reject_request=True, pause_generation=False)
+
+    asyncio.run(main())
+
+
+def test_snapshot_requires_log_stats():
+    async def main():
+        server = _make_server()
+        server.engine.logger_manager = None
+        with pytest.raises(RuntimeError, match="Metrics monitoring requires disable_log_stats=False"):
+            await server.snapshot()
+
+    asyncio.run(main())
+
+
+def test_hybrid_routing_replay_uses_layer_types_on_old_vllm():
+    from packaging import version
+
+    hf_config = SimpleNamespace(layer_types=["attention", "linear_attention"])
+    assert vllm_async_server._hybrid_routing_replay_requires_vllm_022(hf_config, version.parse("0.21.0"))
+    assert not vllm_async_server._hybrid_routing_replay_requires_vllm_022(hf_config, version.parse("0.22.0"))
+
+
+def test_hybrid_routing_replay_fails_closed_without_is_interleaved(monkeypatch):
+    import builtins
+
+    from packaging import version
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "vllm.transformers_utils.config":
+            raise ImportError("missing is_interleaved")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    with pytest.raises(RuntimeError, match="is_interleaved is unavailable"):
+        vllm_async_server._hybrid_routing_replay_requires_vllm_022(SimpleNamespace(), version.parse("0.21.0"))

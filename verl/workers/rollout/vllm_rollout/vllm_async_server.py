@@ -43,7 +43,7 @@ from vllm.v1.metrics.loggers import PrometheusStatLogger
 from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
-from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.net_utils import get_free_port, get_ranked_port_base, is_valid_ipv6_address
 from verl.utils.profiler import (
     build_rollout_dist_profiler,
     build_vllm_profiler_args,
@@ -77,12 +77,38 @@ _VLLM_HYBRID_ROUTING_REPLAY_MIN_VERSION = version.parse("0.22.0")
 
 
 def _hybrid_routing_replay_requires_vllm_022(hf_config: Any, vllm_version: version.Version) -> bool:
+    """Return True when routed-experts capture needs vLLM >= 0.22.0.
+
+    vLLM 0.22+ sizes the host buffer for hybrid-attention KV groups. Older
+    `is_interleaved` helpers were a model-type whitelist and may be missing,
+    so detection is fail-closed when the model type cannot be confirmed.
+    """
     if vllm_version >= _VLLM_HYBRID_ROUTING_REPLAY_MIN_VERSION:
         return False
 
-    from vllm.transformers_utils.config import is_interleaved
+    # Prefer the current (layer_types) hybrid definition so whitelist-era
+    # is_interleaved implementations cannot miss models such as Qwen3.5.
+    layer_types = getattr(hf_config, "layer_types", None)
+    if layer_types:
+        return len(set(layer_types)) > 1
 
-    return is_interleaved(hf_config)
+    try:
+        from vllm.transformers_utils.config import is_interleaved
+    except ImportError as exc:
+        raise RuntimeError(
+            "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
+            f"(installed: {vllm_version}; is_interleaved is unavailable). "
+            "Upgrade vLLM or disable enable_rollout_routing_replay."
+        ) from exc
+
+    try:
+        return bool(is_interleaved(hf_config))
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to determine whether this model needs hybrid-attention "
+            f"routing-replay support on vLLM {vllm_version}. Upgrade to "
+            "vLLM >= 0.22.0 or disable enable_rollout_routing_replay."
+        ) from exc
 
 
 # Max wait for admissions already past the submission gate to reach the engine.
@@ -94,36 +120,6 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
-
-# TODO: remove this VLLM_PORT partition after vLLM RFC
-# https://github.com/vllm-project/vllm/issues/51275 lands in the pinned vLLM
-# (at least #51018 world-group bind-at-time; also #50969 if Ray V2 executor).
-# This is only Category II scan-start mitigation for get_open_port() TOCTOU.
-# Do not add a range-end fallback. Do not delete until the runtime image
-# actually contains those commits and colocated replica cold-start is
-# re-verified without VLLM_PORT.
-_VLLM_PORT_BASE = 25000
-_VLLM_PORT_STRIDE = 32
-_MAX_TCP_PORT = 65535
-
-
-def _get_vllm_port_start(replica_rank: int, node_rank: int, nnodes: int) -> int:
-    """Return a disjoint vLLM internal port-scan start for one server actor.
-
-    TODO: drop this helper with the VLLM_PORT injection below after vLLM #51275.
-    """
-    if replica_rank < 0 or nnodes < 1 or not 0 <= node_rank < nnodes:
-        raise ValueError(
-            f"Invalid vLLM server rank: replica_rank={replica_rank}, node_rank={node_rank}, nnodes={nnodes}"
-        )
-
-    port = _VLLM_PORT_BASE + (replica_rank * nnodes + node_rank) * _VLLM_PORT_STRIDE
-    if port + _VLLM_PORT_STRIDE - 1 > _MAX_TCP_PORT:
-        raise ValueError(
-            f"vLLM port partition exceeds TCP range: "
-            f"replica_rank={replica_rank}, node_rank={node_rank}, nnodes={nnodes}, port={port}"
-        )
-    return port
 
 
 class vLLMHttpServer:
@@ -146,6 +142,7 @@ class vLLMHttpServer:
         cuda_visible_devices: str,
         disaggregation_role: str = "null",
         disaggregation_kv_transfer_config: Optional[dict] = None,
+        port_namespace: str = "rollout",
     ):
         """
         Args:
@@ -159,6 +156,8 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
             disaggregation_role: PD role, or ``"null"`` for normal rollout.
             disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
+            port_namespace (str): stable server namespace used to separate
+                vLLM internal port ranges.
         """
         if disaggregation_role not in ("null", "prefill", "decode"):
             raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
@@ -183,6 +182,14 @@ class vLLMHttpServer:
         # with EADDRINUSE; a stale socket from a crashed run trips the same
         # error on restart.
         os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
+
+        # vLLM probes an available port and releases the socket before its
+        # workers bind the TCPStore. Separate each engine's scan starting point
+        # to avoid concurrent engines selecting the same port in that window.
+        port_namespace = f"{os.environ['VERL_RAY_JOB_ID']}:{port_namespace}"
+        port_rank = replica_rank * max(nnodes, 1) + node_rank
+        self._vllm_port_base = get_ranked_port_base(port_namespace, port_rank)
+        os.environ["VLLM_PORT"] = str(self._vllm_port_base)
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
@@ -745,11 +752,6 @@ class vLLMHttpServer:
                 extra_fields=extra_fields,
             )
 
-        # Direct engine clients bypass the OpenAI serving layer's error check.
-        # Preserve its failure semantics instead of returning an empty completion.
-        if final_res.outputs[0].finish_reason == "error":
-            raise RuntimeError(f"vLLM request {request_id} failed during generation")
-
         # Prefix-cache hit count for this request; consumers surface it as
         # OpenAI usage.prompt_tokens_details.cached_tokens.
         extra_fields["num_cached_tokens"] = getattr(final_res, "num_cached_tokens", None)
@@ -921,10 +923,22 @@ class vLLMHttpServer:
         Args:
             reset_connector: Whether to reset the attached connector's cache.
                 Set to False to retain entries in a shared KV cache pool.
+                Keep True at weight-update boundaries unless cache_salt
+                versioning is in place; otherwise later requests can train
+                against KV computed from previous weights.
         """
         if self.node_rank == 0:
+            # reset_connector=True drops any attached external KV store
+            # (e.g. MooncakeStoreConnector) whose entries were computed
+            # against the previous model weights. With no connector it
+            # is a no-op success, so we can pass it unconditionally.
+            # reset_prefix_cache returns False when blocks are still
+            # referenced; vLLM logs a warning and that is not an error.
             if not await self.engine.reset_prefix_cache(reset_connector=reset_connector):
-                raise RuntimeError("vLLM prefix-cache reset failed")
+                logger.warning(
+                    "vLLM prefix-cache reset returned False because some blocks "
+                    "are still referenced; continuing without treating it as failure"
+                )
 
             await self.engine.reset_mm_cache()
             await self.engine.reset_encoder_cache()
@@ -995,7 +1009,8 @@ class vLLMHttpServer:
     def _prometheus_logger(self) -> PrometheusStatLogger:
         # vLLM has moved PrometheusStatLogger between logger_manager attributes.
         logger_manager = self.engine.logger_manager
-        assert logger_manager is not None
+        if logger_manager is None:
+            raise RuntimeError("Metrics monitoring requires disable_log_stats=False, but it is currently True.")
 
         prometheus_logger = getattr(logger_manager, "prometheus_logger", None)
         if isinstance(prometheus_logger, PrometheusStatLogger):
@@ -1063,6 +1078,9 @@ class vLLMHttpServer:
                 wait until the replica returns to rotation. The flag is re-declared
                 by every abort and cleared by the matching resume, so a subsequent
                 plain abort (e.g. the one inside a weight sync) restores parking.
+            pause_generation: When False, abort in-flight requests without closing
+                the submission gate. reject_request is incompatible with this mode
+                because late arrivals cannot be rejected on an open generation path.
 
         Returns:
             dict[str, Any]: Dictionary containing:
@@ -1076,9 +1094,17 @@ class vLLMHttpServer:
             return {"aborted_count": 0, "request_ids": []}
 
         if not pause_generation:
+            if reject_request:
+                raise ValueError(
+                    "reject_request=True requires pause_generation=True; "
+                    "an open generation path cannot reject late arrivals"
+                )
             request_ids = list(self.engine.output_processor.request_states)
             await self.engine.abort(request_ids, internal=True)
             if reset_prefix_cache:
+                # abort() only queues engine-core cancellation; wait until
+                # blocks are released before reset_prefix_cache.
+                await self.engine.wait_for_requests_to_drain()
                 await self.clear_kv_cache()
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
@@ -1496,15 +1522,6 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
-            # TODO: drop VLLM_PORT injection after vLLM #51275; see `_get_vllm_port_start`.
-            vllm_port_start = _get_vllm_port_start(self.replica_rank, node_rank, nnodes)
-            env_vars["VLLM_PORT"] = str(vllm_port_start)
-            logger.info(
-                "Using vLLM internal port-scan start %s for replica_rank=%s node_rank=%s",
-                vllm_port_start,
-                self.replica_rank,
-                node_rank,
-            )
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -1524,6 +1541,7 @@ class vLLMReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
+                port_namespace=name,
             )
             self.servers.append(server)
 
@@ -1553,18 +1571,33 @@ class vLLMReplica(RolloutReplica):
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self, reject_request: bool = False) -> dict[str, Any]:
+    async def abort_all_requests(
+        self,
+        reject_request: bool = False,
+        reset_prefix_cache: bool = True,
+        *,
+        pause_generation: bool = True,
+    ) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.
 
         Args:
             reject_request: Fail requests arriving behind the closed gate instead of
                 parking them. See vLLMHttpServer.abort_all_requests().
+            reset_prefix_cache: Forwarded to each server abort.
+            pause_generation: Forwarded to each server abort.
 
         Returns:
             dict[str, Any]: Combined abort results from all servers.
         """
         results = await asyncio.gather(
-            *[server.abort_all_requests.remote(reject_request=reject_request) for server in self.servers]
+            *[
+                server.abort_all_requests.remote(
+                    reject_request=reject_request,
+                    reset_prefix_cache=reset_prefix_cache,
+                    pause_generation=pause_generation,
+                )
+                for server in self.servers
+            ]
         )
 
         total_aborted = sum(r.get("aborted_count", 0) for r in results)
@@ -1603,6 +1636,16 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+    async def clear_kv_cache(self, reset_connector: bool = True):
+        """Clear KV caches on every server in this replica."""
+        await asyncio.gather(
+            *[server.clear_kv_cache.remote(reset_connector=reset_connector) for server in self.servers]
+        )
+
+    async def snapshot(self) -> dict[str, Any]:
+        """Return live KV-cache and scheduler observations from the head server."""
+        return await self.servers[0].snapshot.remote()
 
     async def release_kv_cache(self):
         # Drain all in-flight requests so that vLLM worker threads go idle

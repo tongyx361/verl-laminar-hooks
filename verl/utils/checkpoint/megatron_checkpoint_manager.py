@@ -49,6 +49,31 @@ from verl.utils.megatron_utils import (
 
 from .checkpoint_manager import BaseCheckpointManager
 
+
+def _safetensors_staging_root(checkpoint_config: Any) -> str | None:
+    """Return a local POSIX staging directory, or None to write shards in place."""
+    staging_dir = getattr(checkpoint_config, "safetensors_staging_dir", None)
+    if staging_dir is None:
+        return None
+    staging_dir = os.fspath(staging_dir).strip()
+    return staging_dir or None
+
+
+def _copy_file_replace(src: str, dest: str) -> None:
+    """Copy ``src`` onto ``dest`` via a same-directory temp name, then ``os.replace``.
+
+    ``shutil.copyfile`` to the destination is not atomic; a crashed copy can
+    leave a truncated shard. ``os.replace`` swaps the complete temp file in.
+    """
+    tmp_dest = dest + ".tmp"
+    try:
+        shutil.copyfile(src, tmp_dest)
+        os.replace(tmp_dest, dest)
+    finally:
+        if os.path.exists(tmp_dest):
+            os.remove(tmp_dest)
+
+
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -1010,17 +1035,19 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         import safetensors.torch as safetensors_torch
 
         original_serialize_file = safetensors_torch.serialize_file
-        if getattr(self.checkpoint_config, "safetensors_staging", False) and version.parse(
-            safetensors.__version__
-        ) >= version.parse("0.8.0"):
+        staging_root = _safetensors_staging_root(self.checkpoint_config)
+        if staging_root and version.parse(safetensors.__version__) >= version.parse("0.8.0"):
             # Keep safetensors allocation calls off shared filesystem mounts.
+            os.makedirs(staging_root, exist_ok=True)
+
             def serialize_file_via_posix(
                 data: dict[str, Any], filename: str | os.PathLike, metadata: dict[str, str] | None = None
             ) -> None:
-                with tempfile.TemporaryDirectory(prefix="verl_safetensors_", dir="/tmp") as staging_dir:
+                dest = os.fspath(filename)
+                with tempfile.TemporaryDirectory(prefix="verl_safetensors_", dir=staging_root) as staging_dir:
                     shard_path = os.path.join(staging_dir, "shard.safetensors")
                     original_serialize_file(data, shard_path, metadata=metadata)
-                    shutil.copyfile(shard_path, filename)
+                    _copy_file_replace(shard_path, dest)
 
             # save_file resolves this global even when a bridge imported it earlier.
             safetensors_torch.serialize_file = serialize_file_via_posix
