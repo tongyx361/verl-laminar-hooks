@@ -31,5 +31,10 @@ checkpoint:
   # Target dataclass for this configuration
   _target_: verl.workers.config.McoreCheckpointConfig
 
+  # Opt in only when safetensors allocation calls fail on the destination filesystem.
+  # Set to a local POSIX directory to serialize each HF shard there before copying;
+  # null keeps direct writes. Any non-empty path enables staging.
+  safetensors_staging_dir: null
+
   # Mbridge config extension.
   mbridge_config: {}

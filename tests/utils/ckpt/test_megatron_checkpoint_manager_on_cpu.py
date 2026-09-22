@@ -655,3 +655,72 @@ class TestModelShardedStateDictNotBuiltUnnecessarily:
 
         mgr.load_checkpoint(ckpt_path)
         mgr.model[0].sharded_state_dict.assert_called_once()
+
+
+def test_save_hf_via_bridge_skips_staging_when_dir_blank(tmp_path, monkeypatch):
+    """Blank staging_dir is opt-out: serialize_file must write the dest path in place."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import safetensors.torch
+
+    dest_root = tmp_path / "nfs"
+    dest_root.mkdir()
+    dest = dest_root / "model.safetensors"
+    seen = []
+
+    def fake_serialize(data, filename, metadata=None):
+        seen.append(os.fspath(filename))
+        Path(filename).write_bytes(b"ok")
+
+    monkeypatch.setattr(safetensors.torch, "serialize_file", fake_serialize)
+
+    mgr = _make_manager(save_contents=["hf_model"])
+    mgr.checkpoint_config = SimpleNamespace(safetensors_staging_dir="  ", mbridge_config={})
+
+    def save_weights(model, path, **kwargs):
+        safetensors.torch.save_file({"w": torch.zeros(1)}, str(dest))
+
+    mgr.bridge.save_weights.side_effect = save_weights
+    mgr._save_model_as_hf_via_bridge(str(dest_root))
+
+    assert dest.read_bytes() == b"ok"
+    assert seen == [str(dest)]
+    assert safetensors.torch.serialize_file is fake_serialize
+
+
+def test_save_hf_via_bridge_stages_serialize_file(tmp_path, monkeypatch):
+    """Bridge calls ``save_file``; staging must intercept that path, not a wrapper."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import safetensors.torch
+
+    dest_root = tmp_path / "nfs"
+    staging = tmp_path / "scratch"
+    dest_root.mkdir()
+    staging.mkdir()
+    dest = dest_root / "model.safetensors"
+
+    seen = []
+
+    def fake_serialize(data, filename, metadata=None):
+        seen.append(os.fspath(filename))
+        Path(filename).write_bytes(b"ok")
+
+    monkeypatch.setattr(safetensors.torch, "serialize_file", fake_serialize)
+
+    mgr = _make_manager(save_contents=["hf_model"])
+    mgr.checkpoint_config = SimpleNamespace(safetensors_staging_dir=str(staging), mbridge_config={})
+
+    def save_weights(model, path, **kwargs):
+        safetensors.torch.save_file({"w": torch.zeros(1)}, str(dest))
+
+    mgr.bridge.save_weights.side_effect = save_weights
+    mgr._save_model_as_hf_via_bridge(str(dest_root))
+
+    assert dest.read_bytes() == b"ok"
+    assert seen
+    assert all(path.startswith(str(staging)) for path in seen)
+    assert safetensors.torch.serialize_file is fake_serialize
+    mgr.bridge.save_weights.assert_called_once()

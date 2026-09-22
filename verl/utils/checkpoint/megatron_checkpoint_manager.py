@@ -17,8 +17,13 @@ import json
 import logging
 import os
 import random
+import shutil
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 from enum import Enum
+from typing import Any
 
 import megatron.core
 import numpy as np
@@ -45,6 +50,66 @@ from verl.utils.megatron_utils import (
 )
 
 from .checkpoint_manager import BaseCheckpointManager
+
+
+def _safetensors_staging_root(checkpoint_config: Any) -> str | None:
+    """Return a local POSIX staging directory, or None to write shards in place."""
+    staging_dir = getattr(checkpoint_config, "safetensors_staging_dir", None)
+    if staging_dir is None:
+        return None
+    staging_dir = os.fspath(staging_dir).strip()
+    return staging_dir or None
+
+
+def _copy_file_replace(src: str, dest: str) -> None:
+    """Copy ``src`` onto ``dest`` via a same-directory temp name, then ``os.replace``.
+
+    ``shutil.copyfile`` to the destination is not atomic; a crashed copy can
+    leave a truncated shard. ``os.replace`` swaps the complete temp file in.
+    """
+    tmp_dest = dest + ".tmp"
+    try:
+        shutil.copyfile(src, tmp_dest)
+        os.replace(tmp_dest, dest)
+    finally:
+        if os.path.exists(tmp_dest):
+            os.remove(tmp_dest)
+
+
+@contextmanager
+def _stage_safetensors_writes(staging_root: str | None) -> Iterator[None]:
+    """Write each safetensors shard on local POSIX, then copy it to dest.
+
+    Patch ``serialize_file``, not ``save_file``: megatron-bridge binds
+    ``save_file`` at import time, and ``save_file`` looks up ``serialize_file``
+    on every call. Stage per file because ranks share one shard layout and a
+    node-local root cannot see another node's files for a later copytree.
+    ``staging_root=None`` leaves writers untouched.
+    """
+    if staging_root is None:
+        yield
+        return
+
+    import safetensors.torch as safetensors_torch
+
+    os.makedirs(staging_root, exist_ok=True)
+    original_serialize_file = safetensors_torch.serialize_file
+
+    def serialize_via_staging(
+        data: dict[str, Any], filename: str | os.PathLike, metadata: dict[str, str] | None = None
+    ) -> None:
+        dest = os.fspath(filename)
+        with tempfile.TemporaryDirectory(prefix="verl_safetensors_", dir=staging_root) as tmp:
+            shard = os.path.join(tmp, os.path.basename(dest) or "shard.safetensors")
+            original_serialize_file(data, shard, metadata=metadata)
+            _copy_file_replace(shard, dest)
+
+    safetensors_torch.serialize_file = serialize_via_staging
+    try:
+        yield
+    finally:
+        safetensors_torch.serialize_file = original_serialize_file
+
 
 # Setup logging
 logger = logging.getLogger(__file__)
@@ -1003,10 +1068,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     def _save_model_as_hf_via_bridge(self, hf_ckpt_path: str):
         """Save model weights through megatron-bridge."""
-        if self.vanilla_bridge:
-            self.bridge.save_weights(self.model, hf_ckpt_path, **self._get_bridge_extended_args())
-        else:
-            if self.peft_cls is not None:
+        with _stage_safetensors_writes(_safetensors_staging_root(self.checkpoint_config)):
+            if self.vanilla_bridge:
+                self.bridge.save_weights(self.model, hf_ckpt_path, **self._get_bridge_extended_args())
+            elif self.peft_cls is not None:
                 hf_adapter_ckpt_path = os.path.join(hf_ckpt_path, "adapter")
                 self.bridge.save_hf_adapter(self.model, hf_adapter_ckpt_path, self.peft_cls)
                 log_with_rank(

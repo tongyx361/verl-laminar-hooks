@@ -39,6 +39,11 @@ class McoreCheckpointConfig(CheckpointConfig):
     when it forwards kwargs to ``bridge.save_weights()``.
 
     Args:
+        safetensors_staging_dir (str | None): Local POSIX directory used to
+            serialize each HF shard before copying it to the destination.
+            ``None`` (the default) writes shards directly to the destination.
+            Any non-empty path enables staging; the installed safetensors
+            version is not consulted.
         mbridge_config (dict[str, Any]): Extra kwargs forwarded to
             ``bridge.save_weights``. Typical keys include
             ``distributed_filesystem`` and ``memory_efficient`` for the
@@ -46,4 +51,5 @@ class McoreCheckpointConfig(CheckpointConfig):
             bridge's ``save_weights`` signature are silently ignored.
     """
 
+    safetensors_staging_dir: str | None = None
     mbridge_config: dict[str, Any] = field(default_factory=dict)
