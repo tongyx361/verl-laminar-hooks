@@ -80,6 +80,10 @@ def _copy_file_replace(src: str, dest: str) -> None:
 def _stage_safetensors_writes(staging_root: str | None) -> Iterator[None]:
     """Write each safetensors shard on local POSIX, then copy it to dest.
 
+    Some shared, network, or mounted filesystems reject the allocation calls
+    safetensors makes while creating a shard in place. A finished file can
+    still be copied onto those paths, so staging is the opt-in workaround.
+
     Patch ``serialize_file``, not ``save_file``: megatron-bridge binds
     ``save_file`` at import time, and ``save_file`` looks up ``serialize_file``
     on every call. Stage per file because ranks share one shard layout and a

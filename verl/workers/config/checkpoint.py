@@ -41,9 +41,10 @@ class McoreCheckpointConfig(CheckpointConfig):
     Args:
         safetensors_staging_dir (str | None): Local POSIX directory used to
             serialize each HF shard before copying it to the destination.
-            ``None`` (the default) writes shards directly to the destination.
-            Any non-empty path enables staging; the installed safetensors
-            version is not consulted.
+            Set this when that destination is a shared, network, or mounted
+            filesystem that rejects safetensors allocation calls. ``None``
+            (the default) writes shards directly. Any non-empty path enables
+            staging; the installed safetensors version is not consulted.
         mbridge_config (dict[str, Any]): Extra kwargs forwarded to
             ``bridge.save_weights``. Typical keys include
             ``distributed_filesystem`` and ``memory_efficient`` for the
