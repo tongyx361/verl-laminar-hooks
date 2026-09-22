@@ -44,6 +44,11 @@ class _FakeEngine:
         self.pause_calls = 0
         self.resume_calls = 0
         self.admitting_at_pause = None
+        self.abort_calls = []
+        self.drain_calls = 0
+        self.reset_prefix_calls = 0
+        self.reset_mm_calls = 0
+        self.reset_encoder_calls = 0
 
     async def pause_generation(self, **kwargs):
         self.pause_calls += 1
@@ -51,6 +56,21 @@ class _FakeEngine:
 
     async def resume_generation(self):
         self.resume_calls += 1
+
+    async def abort(self, request_ids, internal=True):
+        self.abort_calls.append(list(request_ids))
+
+    async def wait_for_requests_to_drain(self):
+        self.drain_calls += 1
+
+    async def reset_prefix_cache(self, reset_connector=True):
+        self.reset_prefix_calls += 1
+
+    async def reset_mm_cache(self):
+        self.reset_mm_calls += 1
+
+    async def reset_encoder_cache(self):
+        self.reset_encoder_calls += 1
 
 
 def _make_server(node_rank: int = 0):
@@ -64,6 +84,7 @@ def _make_server(node_rank: int = 0):
     server._resume_event = asyncio.Event()
     server._resume_event.set()
     server._rejecting = False
+    server._disaggregation_role = "null"
     return server
 
 
@@ -199,5 +220,42 @@ def test_barrier_times_out_instead_of_hanging(monkeypatch):
         await asyncio.wait_for(server.abort_all_requests(), timeout=5)
 
         assert server.engine.pause_calls == 1, "barrier must proceed rather than deadlock"
+
+    asyncio.run(main())
+
+
+def test_abort_requests_aborts_without_pausing_or_clearing_cache():
+    async def main():
+        server = _make_server()
+        server.engine.output_processor.request_states = {"r1": object(), "r2": object()}
+
+        result = await server.abort_requests()
+
+        assert server._submission_paused is False
+        assert server.engine.pause_calls == 0
+        assert server.engine.abort_calls == [["r1", "r2"]]
+        assert server.engine.drain_calls == 0
+        assert server.engine.reset_prefix_calls == 0
+        assert result["aborted_count"] == 2
+
+    asyncio.run(main())
+
+
+def test_snapshot_rejects_pd_disaggregation():
+    async def main():
+        server = _make_server()
+        server._disaggregation_role = "prefill"
+        with pytest.raises(NotImplementedError, match="does not support PD disaggregation"):
+            await server.snapshot()
+
+    asyncio.run(main())
+
+
+def test_snapshot_rejects_headless_node_without_touching_engine():
+    async def main():
+        server = _make_server(node_rank=1)
+        del server.engine
+        with pytest.raises(RuntimeError, match="requires the node-rank-0 AsyncLLM"):
+            await server.snapshot()
 
     asyncio.run(main())

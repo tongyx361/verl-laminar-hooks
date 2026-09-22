@@ -38,6 +38,7 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 
 from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
@@ -690,7 +691,7 @@ class vLLMHttpServer:
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
-        # Handle abort case: when the request is aborted by pause_generation(abort),
+        # Handle abort case: when the request is aborted by abort_all_requests,
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
         if not final_res.outputs:
@@ -894,6 +895,82 @@ class vLLMHttpServer:
         await self.engine.wake_up(tags=["kv_cache"])
         await self.engine.reset_prefix_cache(reset_connector=True)
 
+    async def snapshot(self) -> dict[str, Any]:
+        """Return live KV-cache and scheduler queue observations.
+
+        Values come from vLLM's PrometheusStatLogger gauges so callers can
+        route or admit traffic without scraping the HTTP metrics endpoint.
+
+        PD disaggregation is not supported: prefill and decode engines keep
+        independent KV pools and schedulers, so one engine's gauges are not a
+        replica snapshot.
+
+        Only node rank 0 owns AsyncLLM. Other actors in a multi-node replica
+        run vLLM headless and have no engine to observe.
+        """
+        # TODO: aggregate prefill + decode KV/scheduler stats for PD replicas.
+        if self._disaggregation_role != "null":
+            raise NotImplementedError("vLLMHttpServer.snapshot() does not support PD disaggregation")
+        # Match abort_requests: headless actors must fail before touching self.engine.
+        if self.node_rank != 0 or not hasattr(self, "engine"):
+            raise RuntimeError(
+                "vLLMHttpServer.snapshot() requires the node-rank-0 AsyncLLM; "
+                f"node_rank={self.node_rank} actors run headless and have no engine."
+            )
+        prometheus_logger = self._prometheus_logger
+        kv_cache_usage = self._prometheus_values(
+            prometheus_logger.gauge_kv_cache_usage,
+            "vllm:kv_cache_usage_perc",
+        )
+        if not kv_cache_usage:
+            raise RuntimeError("vLLM KV-cache gauges are unavailable")
+        return {
+            "kv_cache_usage": max(kv_cache_usage),
+            "num_waiting_requests": int(
+                sum(
+                    self._prometheus_values(
+                        prometheus_logger.gauge_scheduler_waiting,
+                        "vllm:num_requests_waiting",
+                    )
+                )
+            ),
+            "num_running_requests": int(
+                sum(
+                    self._prometheus_values(
+                        prometheus_logger.gauge_scheduler_running,
+                        "vllm:num_requests_running",
+                    )
+                )
+            ),
+        }
+
+    @staticmethod
+    def _prometheus_values(metrics_by_engine: dict[int, Any], sample_name: str) -> list[float]:
+        return [
+            float(sample.value)
+            for metric in metrics_by_engine.values()
+            for family in metric.collect()
+            for sample in family.samples
+            if sample.name == sample_name
+        ]
+
+    @property
+    def _prometheus_logger(self) -> PrometheusStatLogger:
+        # vLLM has moved PrometheusStatLogger between logger_manager attributes.
+        logger_manager = self.engine.logger_manager
+        if logger_manager is None:
+            raise RuntimeError("Metrics monitoring requires disable_log_stats=False, but it is currently True.")
+
+        prometheus_logger = getattr(logger_manager, "prometheus_logger", None)
+        if isinstance(prometheus_logger, PrometheusStatLogger):
+            return prometheus_logger
+
+        for stat_logger in getattr(logger_manager, "stat_loggers", []):
+            if isinstance(stat_logger, PrometheusStatLogger):
+                return stat_logger
+
+        raise RuntimeError("Unable to locate vLLM PrometheusStatLogger on logger_manager.")
+
     def _should_profile(self) -> bool:
         """Whether this replica drives the engine profiler."""
         return (
@@ -931,15 +1008,32 @@ class vLLMHttpServer:
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
+    async def abort_requests(self) -> dict[str, Any]:
+        """Abort current engine requests without pausing generation.
+
+        Admission stays open and caches are left untouched. Use abort_request()
+        for a single id, and abort_all_requests() to pause the replica.
+
+        Returns:
+            dict[str, Any]: aborted_count and request_ids.
+        """
+        # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
+        # multi-node replica run vLLM's headless entry point, so there is no
+        # engine object to abort through on those actors.
+        if self.node_rank != 0:
+            return {"aborted_count": 0, "request_ids": []}
+
+        request_ids = list(self.engine.output_processor.request_states)
+        await self.engine.abort(request_ids, internal=True)
+        return {"aborted_count": len(request_ids), "request_ids": request_ids}
+
     async def abort_all_requests(self, reset_prefix_cache: bool = True, reject_request: bool = False) -> dict[str, Any]:
-        """Abort all ongoing generation requests.
+        """Pause the replica: close admission, abort in-flight work, optionally clear caches.
 
-        On vLLM >= 0.12.0, uses AsyncLLM.pause_generation() to abort in-flight
-        requests, drain, and clear caches. The engine remains paused after this
-        call — use resume_generation() to accept new requests (e.g. before
-        validation).
+        TODO: rename abort_all_requests; this pauses the replica and is not
+        the same as abort_requests, which only cancels in-flight engine work.
 
-        On vLLM < 0.12.0, manually aborts each request and resets prefix cache.
+        Call resume_generation() before accepting new requests.
 
         Args:
             reset_prefix_cache: Clear the prefix/mm caches along with the pause.
@@ -948,17 +1042,14 @@ class vLLMHttpServer:
                 the load balancer with no resume_generation coming soon (a hybrid
                 replica handed back to training); parked requests would otherwise
                 wait until the replica returns to rotation. The flag is re-declared
-                by every abort and cleared by the matching resume, so a subsequent
-                plain abort (e.g. the one inside a weight sync) restores parking.
+                by every pause and cleared by the matching resume, so a subsequent
+                plain pause (e.g. the one inside a weight sync) restores parking.
 
         Returns:
             dict[str, Any]: Dictionary containing:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
-        # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
-        # multi-node replica run vLLM's headless entry point, so there is no
-        # engine object to abort through on those actors.
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
 
@@ -982,7 +1073,7 @@ class vLLMHttpServer:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
 
-            # pause_generation with wait_for_inflight_requests=False will:
+            # engine.pause_generation with wait_for_inflight_requests=False will:
             # 1. Set engine to paused state (new requests are accepted but not scheduled)
             # 2. Abort all in-flight requests
             # 3. Wait for requests to drain
@@ -1018,7 +1109,7 @@ class vLLMHttpServer:
         self._resume_event.set()
 
     async def resume_generation(self):
-        """Resume generation after abort_all_requests (pause_generation)."""
+        """Resume generation after abort_all_requests."""
         await self.resume_engine_generation()
         await self.open_submission_gate()
 
@@ -1424,19 +1515,36 @@ class vLLMReplica(RolloutReplica):
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self, reject_request: bool = False) -> dict[str, Any]:
-        """Abort all ongoing generation requests across all servers.
-
-        Args:
-            reject_request: Fail requests arriving behind the closed gate instead of
-                parking them. See vLLMHttpServer.abort_all_requests().
-
-        Returns:
-            dict[str, Any]: Combined abort results from all servers.
-        """
+    async def abort_all_requests(
+        self,
+        reject_request: bool = False,
+        reset_prefix_cache: bool = True,
+    ) -> dict[str, Any]:
+        """Pause generation on every server. See vLLMHttpServer.abort_all_requests()."""
         results = await asyncio.gather(
-            *[server.abort_all_requests.remote(reject_request=reject_request) for server in self.servers]
+            *[
+                server.abort_all_requests.remote(
+                    reject_request=reject_request,
+                    reset_prefix_cache=reset_prefix_cache,
+                )
+                for server in self.servers
+            ]
         )
+
+        total_aborted = sum(r.get("aborted_count", 0) for r in results)
+        all_request_ids = []
+        for r in results:
+            all_request_ids.extend(r.get("request_ids", []))
+
+        return {
+            "aborted_count": total_aborted,
+            "request_ids": all_request_ids,
+            "server_results": results,
+        }
+
+    async def abort_requests(self) -> dict[str, Any]:
+        """Abort current engine requests without pausing. See vLLMHttpServer.abort_requests()."""
+        results = await asyncio.gather(*[server.abort_requests.remote() for server in self.servers])
 
         total_aborted = sum(r.get("aborted_count", 0) for r in results)
         all_request_ids = []
@@ -1474,6 +1582,17 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+    async def snapshot(self) -> dict[str, Any]:
+        """Return live KV-cache and scheduler observations from the head server.
+
+        Colocated / non-PD replicas report the head HTTP server. PD is out of
+        scope: prefill and decode engines have independent KV pools.
+        """
+        # TODO: aggregate prefill + decode snapshots for PD replicas.
+        if self.config.disaggregation.enabled:
+            raise NotImplementedError("vLLMReplica.snapshot() does not support PD disaggregation")
+        return await self.servers[0].snapshot.remote()
 
     async def release_kv_cache(self):
         # Drain all in-flight requests so that vLLM worker threads go idle
