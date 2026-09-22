@@ -64,9 +64,6 @@ def _copy_file_replace(src: str, dest: str) -> None:
 
     ``shutil.copyfile`` to the destination is not atomic; a crashed copy can
     leave a truncated shard. ``os.replace`` swaps the complete temp file in.
-    The destination must allow that same-directory replace. A mount that
-    rejects ``rename`` entirely (mountpoint-s3, safetensors#792) cannot take
-    this publish step.
     """
     tmp_dest = dest + ".tmp"
     try:
@@ -1040,11 +1037,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         original_serialize_file = safetensors_torch.serialize_file
         staging_root = _safetensors_staging_root(self.checkpoint_config)
         if staging_root and version.parse(safetensors.__version__) >= version.parse("0.8.0"):
-            # safetensors >= 0.8 serialize_file (safetensors#764) calls File::set_len
-            # and then rename/chmod on a sibling temp file. HDFS FUSE returns ENOSYS
-            # from set_len (safetensors#787); mountpoint-s3 fails the rename/chmod
-            # (safetensors#792). Serialize on this local POSIX directory instead.
-            # Older safetensors already write in place, so they skip this path.
+            # Keep safetensors allocation calls off shared filesystem mounts.
             os.makedirs(staging_root, exist_ok=True)
 
             def serialize_file_via_posix(
