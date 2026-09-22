@@ -47,8 +47,6 @@ class _FakeEngine:
         self.abort_calls = []
         self.drain_calls = 0
         self.reset_prefix_calls = 0
-        self.reset_mm_calls = 0
-        self.reset_encoder_calls = 0
 
     async def pause_generation(self, **kwargs):
         self.pause_calls += 1
@@ -65,12 +63,6 @@ class _FakeEngine:
 
     async def reset_prefix_cache(self, reset_connector=True):
         self.reset_prefix_calls += 1
-
-    async def reset_mm_cache(self):
-        self.reset_mm_calls += 1
-
-    async def reset_encoder_cache(self):
-        self.reset_encoder_calls += 1
 
 
 def _make_server(node_rank: int = 0):

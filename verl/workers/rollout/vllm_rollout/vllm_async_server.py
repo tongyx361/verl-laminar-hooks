@@ -691,7 +691,7 @@ class vLLMHttpServer:
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
-        # Handle abort case: when the request is aborted by abort_all_requests,
+        # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
         if not final_res.outputs:
@@ -1028,12 +1028,14 @@ class vLLMHttpServer:
         return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True, reject_request: bool = False) -> dict[str, Any]:
-        """Pause the replica: close admission, abort in-flight work, optionally clear caches.
+        """Abort all ongoing generation requests.
 
-        TODO: rename abort_all_requests; this pauses the replica and is not
-        the same as abort_requests, which only cancels in-flight engine work.
+        On vLLM >= 0.12.0, uses AsyncLLM.pause_generation() to abort in-flight
+        requests, drain, and clear caches. The engine remains paused after this
+        call — use resume_generation() to accept new requests (e.g. before
+        validation).
 
-        Call resume_generation() before accepting new requests.
+        On vLLM < 0.12.0, manually aborts each request and resets prefix cache.
 
         Args:
             reset_prefix_cache: Clear the prefix/mm caches along with the pause.
@@ -1042,14 +1044,17 @@ class vLLMHttpServer:
                 the load balancer with no resume_generation coming soon (a hybrid
                 replica handed back to training); parked requests would otherwise
                 wait until the replica returns to rotation. The flag is re-declared
-                by every pause and cleared by the matching resume, so a subsequent
-                plain pause (e.g. the one inside a weight sync) restores parking.
+                by every abort and cleared by the matching resume, so a subsequent
+                plain abort (e.g. the one inside a weight sync) restores parking.
 
         Returns:
             dict[str, Any]: Dictionary containing:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
+        # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
+        # multi-node replica run vLLM's headless entry point, so there is no
+        # engine object to abort through on those actors.
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
 
@@ -1073,7 +1078,7 @@ class vLLMHttpServer:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
 
-            # engine.pause_generation with wait_for_inflight_requests=False will:
+            # pause_generation with wait_for_inflight_requests=False will:
             # 1. Set engine to paused state (new requests are accepted but not scheduled)
             # 2. Abort all in-flight requests
             # 3. Wait for requests to drain
@@ -1109,7 +1114,7 @@ class vLLMHttpServer:
         self._resume_event.set()
 
     async def resume_generation(self):
-        """Resume generation after abort_all_requests."""
+        """Resume generation after abort_all_requests (pause_generation)."""
         await self.resume_engine_generation()
         await self.open_submission_gate()
 
@@ -1520,7 +1525,17 @@ class vLLMReplica(RolloutReplica):
         reject_request: bool = False,
         reset_prefix_cache: bool = True,
     ) -> dict[str, Any]:
-        """Pause generation on every server. See vLLMHttpServer.abort_all_requests()."""
+        """Abort all ongoing generation requests across all servers.
+
+        Args:
+            reject_request: Fail requests arriving behind the closed gate instead of
+                parking them. See vLLMHttpServer.abort_all_requests().
+            reset_prefix_cache: Clear the prefix/mm caches along with the pause.
+                See vLLMHttpServer.abort_all_requests().
+
+        Returns:
+            dict[str, Any]: Combined abort results from all servers.
+        """
         results = await asyncio.gather(
             *[
                 server.abort_all_requests.remote(
