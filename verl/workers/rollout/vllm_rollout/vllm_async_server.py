@@ -1015,7 +1015,9 @@ class vLLMHttpServer:
         for a single id, and abort_all_requests() to pause the replica.
 
         Returns:
-            dict[str, Any]: aborted_count and request_ids.
+            dict[str, Any]: aborted_count and request_ids for in-flight
+            requests. Parallel-sampling parent ids are aborted so their
+            bookkeeping is released, and are not included in the count.
         """
         # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
         # multi-node replica run vLLM's headless entry point, so there is no
@@ -1023,8 +1025,16 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
 
-        request_ids = list(self.engine.output_processor.request_states)
-        await self.engine.abort(request_ids, internal=True)
+        processor = self.engine.output_processor
+        # request_states holds in-flight requests. For sampling n>1 those are
+        # child ids; the ParentRequest lives in parent_requests under the parent
+        # id and is not a request_states key. engine.abort pops that entry only
+        # when the parent id is passed. Children come first: aborting the parent
+        # id first recursively aborts children, and this call has already
+        # detached them from external_req_ids, so the recursive remove throws.
+        request_ids = list(processor.request_states)
+        parent_ids = [parent_id for parent_id in processor.parent_requests if parent_id not in processor.request_states]
+        await self.engine.abort([*request_ids, *parent_ids], internal=True)
         return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True, reject_request: bool = False) -> dict[str, Any]:

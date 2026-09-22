@@ -39,7 +39,7 @@ class _FakeEngine:
     """Records the state of the gate at the moment the engine is paused."""
 
     def __init__(self):
-        self.output_processor = SimpleNamespace(request_states={})
+        self.output_processor = SimpleNamespace(request_states={}, parent_requests={})
         self.server = None
         self.pause_calls = 0
         self.resume_calls = 0
@@ -229,6 +229,26 @@ def test_abort_requests_aborts_without_pausing_or_clearing_cache():
         assert server.engine.drain_calls == 0
         assert server.engine.reset_prefix_calls == 0
         assert result["aborted_count"] == 2
+        assert result["request_ids"] == ["r1", "r2"]
+
+    asyncio.run(main())
+
+
+def test_abort_requests_releases_parallel_sampling_parents():
+    """n>1 parents live outside request_states and must be aborted after children."""
+
+    async def main():
+        server = _make_server()
+        server.engine.output_processor.request_states = {"0_p": object(), "1_p": object()}
+        server.engine.output_processor.parent_requests = {"p": object()}
+
+        result = await server.abort_requests()
+
+        assert server.engine.abort_calls == [["0_p", "1_p", "p"]]
+        assert result["aborted_count"] == 2
+        assert result["request_ids"] == ["0_p", "1_p"]
+        assert server._submission_paused is False
+        assert server.engine.pause_calls == 0
 
     asyncio.run(main())
 
