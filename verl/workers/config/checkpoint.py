@@ -40,9 +40,18 @@ class McoreCheckpointConfig(CheckpointConfig):
 
     Args:
         safetensors_staging_dir (str | None): Local POSIX directory used to
-            serialize HF shards before copying them to the destination, for
-            filesystems incompatible with safetensors >= 0.8 allocation calls.
-            ``None`` (the default) writes shards directly to the destination.
+            serialize each HF shard before copying it to the destination.
+            ``None`` or blank (the default) writes shards directly. Set a
+            directory only when that destination cannot finish safetensors
+            >= 0.8 ``serialize_file`` (safetensors#764). HDFS FUSE returns
+            ENOSYS from that writer's ``File::set_len`` (safetensors#787).
+            mountpoint-s3 fails the sibling tempfile ``rename``/``chmod``
+            with ENOSYS or EPERM (safetensors#792). Ordinary local disks stay
+            unset. Staging runs only when this path is non-empty and
+            safetensors is >= 0.8; older releases already write in place.
+            The finished shard is still published with ``os.replace`` on the
+            destination, so a mount that cannot rename at all is outside this
+            workaround. This is not ``mbridge_config.distributed_filesystem``.
         mbridge_config (dict[str, Any]): Extra kwargs forwarded to
             ``bridge.save_weights``. Typical keys include
             ``distributed_filesystem`` and ``memory_efficient`` for the
