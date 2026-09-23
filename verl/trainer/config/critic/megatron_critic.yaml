@@ -31,13 +31,7 @@ checkpoint:
   # Target dataclass for this configuration
   _target_: verl.workers.config.McoreCheckpointConfig
 
-  # Local POSIX directory for HF safetensors shards. null writes the destination
-  # directly. Set this only when that destination cannot finish safetensors >= 0.8
-  # serialize_file (safetensors#764): HDFS FUSE returns ENOSYS from File::set_len
-  # (safetensors#787); mountpoint-s3 fails the tempfile rename/chmod
-  # (safetensors#792). Ordinary local disks stay null. Any non-empty path enables
-  # staging; the safetensors version is not checked. The copy back still needs a
-  # same-directory replace on the destination. Not distributed_filesystem.
+  # See McoreCheckpointConfig.safetensors_staging_dir in verl/workers/config/checkpoint.py.
   safetensors_staging_dir: null
 
   # Mbridge config extension.

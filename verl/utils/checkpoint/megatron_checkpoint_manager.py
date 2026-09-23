@@ -66,9 +66,8 @@ def _copy_file_replace(src: str, dest: str) -> None:
 
     ``shutil.copyfile`` to the destination is not atomic; a crashed copy can
     leave a truncated shard. ``os.replace`` swaps the complete temp file in.
-    The destination must allow that same-directory replace. A mount that
-    rejects ``rename`` entirely (mountpoint-s3, safetensors#792) cannot take
-    this publish step.
+    Which destinations can take that replace:
+    :attr:`verl.workers.config.checkpoint.McoreCheckpointConfig.safetensors_staging_dir`.
     """
     tmp_dest = dest + ".tmp"
     try:
@@ -83,15 +82,8 @@ def _copy_file_replace(src: str, dest: str) -> None:
 def _stage_safetensors_writes(staging_root: str | None) -> Iterator[None]:
     """Serialize each HF shard on local POSIX, then copy it to the destination.
 
-    Set ``staging_root`` only when the destination cannot finish safetensors
-    >= 0.8 ``serialize_file``. That writer (safetensors#764) preallocates with
-    ``File::set_len`` and then ``rename``/``chmod``s a sibling temp file. HDFS
-    FUSE returns ENOSYS from ``set_len`` (safetensors#787). mountpoint-s3
-    returns ENOSYS or EPERM from the rename/chmod (safetensors#792). Running
-    ``serialize_file`` here keeps those calls on a local POSIX directory.
-    Leave ``staging_root`` unset for filesystems that already accept the 0.8
-    writer, including ordinary local disks. The copy back still ``os.replace``s
-    a sibling on the destination.
+    When to set ``staging_root``:
+    :attr:`verl.workers.config.checkpoint.McoreCheckpointConfig.safetensors_staging_dir`.
 
     Patch ``serialize_file``, not ``save_file``: megatron-bridge binds
     ``save_file`` at import time, and ``save_file`` looks up ``serialize_file``
