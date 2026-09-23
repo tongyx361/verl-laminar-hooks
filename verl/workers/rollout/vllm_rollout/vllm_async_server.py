@@ -1012,18 +1012,18 @@ class vLLMHttpServer:
         self,
         reset_prefix_cache: bool = True,
         reject_request: bool = False,
-        pause_generation: bool = True,
+        abort_only: bool = False,
     ) -> dict[str, Any]:
         """Abort in-flight requests, optionally pausing the replica.
 
-        pause_generation=True (default) closes admission, aborts in-flight work,
-        and optionally clears caches. The engine remains paused after this
-        call — use resume_generation() to accept new requests (e.g. before
-        validation).
+        The default closes admission, aborts in-flight work, and optionally
+        clears caches. The engine remains paused after this call — use
+        resume_generation() to accept new requests (e.g. before validation).
 
-        pause_generation=False only cancels current engine requests. Admission
-        stays open and caches are left untouched. reset_prefix_cache and
-        reject_request apply only when pausing. Use abort_request() for a single id.
+        abort_only=True only cancels current engine requests. Admission stays
+        open and caches are left untouched. reset_prefix_cache and
+        reject_request apply only when abort_only is False. Use abort_request()
+        for a single id.
 
         Args:
             reset_prefix_cache: Clear the prefix/mm caches along with the pause.
@@ -1034,8 +1034,8 @@ class vLLMHttpServer:
                 wait until the replica returns to rotation. The flag is re-declared
                 by every pause and cleared by the matching resume, so a subsequent
                 plain pause (e.g. the one inside a weight sync) restores parking.
-            pause_generation: Close admission and pause the engine. False aborts
-                in-flight requests only.
+            abort_only: Cancel in-flight requests and leave admission open.
+                reset_prefix_cache and reject_request are ignored.
 
         Returns:
             dict[str, Any]: Dictionary containing:
@@ -1050,7 +1050,7 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
 
-        if not pause_generation:
+        if abort_only:
             processor = self.engine.output_processor
             # request_states holds in-flight requests. For sampling n>1 those are
             # child ids; the ParentRequest lives in parent_requests under the parent
@@ -1531,20 +1531,20 @@ class vLLMReplica(RolloutReplica):
         self,
         reject_request: bool = False,
         reset_prefix_cache: bool = True,
-        pause_generation: bool = True,
+        abort_only: bool = False,
     ) -> dict[str, Any]:
         """Abort in-flight requests on every server.
 
-        pause_generation=True (default) also closes admission. See
+        abort_only=False (default) also closes admission. See
         vLLMHttpServer.abort_all_requests(). reset_prefix_cache and
-        reject_request apply only when pausing.
+        reject_request apply only when abort_only is False.
         """
         results = await asyncio.gather(
             *[
                 server.abort_all_requests.remote(
                     reject_request=reject_request,
                     reset_prefix_cache=reset_prefix_cache,
-                    pause_generation=pause_generation,
+                    abort_only=abort_only,
                 )
                 for server in self.servers
             ]
