@@ -216,12 +216,13 @@ def test_barrier_times_out_instead_of_hanging(monkeypatch):
     asyncio.run(main())
 
 
-def test_abort_requests_aborts_without_pausing_or_clearing_cache():
+def test_abort_all_requests_without_pause_leaves_admission_open():
     async def main():
         server = _make_server()
         server.engine.output_processor.request_states = {"r1": object(), "r2": object()}
 
-        result = await server.abort_requests()
+        # Default reset_prefix_cache=True must not clear caches when not pausing.
+        result = await server.abort_all_requests(pause_generation=False)
 
         assert server._submission_paused is False
         assert server.engine.pause_calls == 0
@@ -234,7 +235,7 @@ def test_abort_requests_aborts_without_pausing_or_clearing_cache():
     asyncio.run(main())
 
 
-def test_abort_requests_releases_parallel_sampling_parents():
+def test_abort_all_requests_without_pause_releases_parallel_sampling_parents():
     """n>1 parents live outside request_states and must be aborted after children."""
 
     async def main():
@@ -242,7 +243,7 @@ def test_abort_requests_releases_parallel_sampling_parents():
         server.engine.output_processor.request_states = {"0_p": object(), "1_p": object()}
         server.engine.output_processor.parent_requests = {"p": object()}
 
-        result = await server.abort_requests()
+        result = await server.abort_all_requests(pause_generation=False)
 
         assert server.engine.abort_calls == [["0_p", "1_p", "p"]]
         assert result["aborted_count"] == 2

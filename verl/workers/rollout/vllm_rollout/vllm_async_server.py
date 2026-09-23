@@ -911,7 +911,7 @@ class vLLMHttpServer:
         # TODO: aggregate prefill + decode KV/scheduler stats for PD replicas.
         if self._disaggregation_role != "null":
             raise NotImplementedError("vLLMHttpServer.snapshot() does not support PD disaggregation")
-        # Match abort_requests: headless actors must fail before touching self.engine.
+        # Match abort_all_requests: headless actors must fail before touching self.engine.
         if self.node_rank != 0 or not hasattr(self, "engine"):
             raise RuntimeError(
                 "vLLMHttpServer.snapshot() requires the node-rank-0 AsyncLLM; "
@@ -1008,44 +1008,22 @@ class vLLMHttpServer:
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
-    async def abort_requests(self) -> dict[str, Any]:
-        """Abort current engine requests without pausing generation.
+    async def abort_all_requests(
+        self,
+        reset_prefix_cache: bool = True,
+        reject_request: bool = False,
+        pause_generation: bool = True,
+    ) -> dict[str, Any]:
+        """Abort in-flight requests, optionally pausing the replica.
 
-        Admission stays open and caches are left untouched. Use abort_request()
-        for a single id, and abort_all_requests() to pause the replica.
-
-        Returns:
-            dict[str, Any]: aborted_count and request_ids for in-flight
-            requests. Parallel-sampling parent ids are aborted so their
-            bookkeeping is released, and are not included in the count.
-        """
-        # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
-        # multi-node replica run vLLM's headless entry point, so there is no
-        # engine object to abort through on those actors.
-        if self.node_rank != 0:
-            return {"aborted_count": 0, "request_ids": []}
-
-        processor = self.engine.output_processor
-        # request_states holds in-flight requests. For sampling n>1 those are
-        # child ids; the ParentRequest lives in parent_requests under the parent
-        # id and is not a request_states key. engine.abort pops that entry only
-        # when the parent id is passed. Children come first: aborting the parent
-        # id first recursively aborts children, and this call has already
-        # detached them from external_req_ids, so the recursive remove throws.
-        request_ids = list(processor.request_states)
-        parent_ids = [parent_id for parent_id in processor.parent_requests if parent_id not in processor.request_states]
-        await self.engine.abort([*request_ids, *parent_ids], internal=True)
-        return {"aborted_count": len(request_ids), "request_ids": request_ids}
-
-    async def abort_all_requests(self, reset_prefix_cache: bool = True, reject_request: bool = False) -> dict[str, Any]:
-        """Abort all ongoing generation requests.
-
-        On vLLM >= 0.12.0, uses AsyncLLM.pause_generation() to abort in-flight
-        requests, drain, and clear caches. The engine remains paused after this
+        pause_generation=True (default) closes admission, aborts in-flight work,
+        and optionally clears caches. The engine remains paused after this
         call — use resume_generation() to accept new requests (e.g. before
         validation).
 
-        On vLLM < 0.12.0, manually aborts each request and resets prefix cache.
+        pause_generation=False only cancels current engine requests. Admission
+        stays open and caches are left untouched. reset_prefix_cache and
+        reject_request apply only when pausing. Use abort_request() for a single id.
 
         Args:
             reset_prefix_cache: Clear the prefix/mm caches along with the pause.
@@ -1054,19 +1032,38 @@ class vLLMHttpServer:
                 the load balancer with no resume_generation coming soon (a hybrid
                 replica handed back to training); parked requests would otherwise
                 wait until the replica returns to rotation. The flag is re-declared
-                by every abort and cleared by the matching resume, so a subsequent
-                plain abort (e.g. the one inside a weight sync) restores parking.
+                by every pause and cleared by the matching resume, so a subsequent
+                plain pause (e.g. the one inside a weight sync) restores parking.
+            pause_generation: Close admission and pause the engine. False aborts
+                in-flight requests only.
 
         Returns:
             dict[str, Any]: Dictionary containing:
                 - aborted_count: Number of requests aborted
-                - request_ids: List of aborted request IDs
+                - request_ids: List of aborted request IDs. Parallel-sampling
+                  parent ids are aborted so their bookkeeping is released, and
+                  are not included in the count.
         """
         # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
         # multi-node replica run vLLM's headless entry point, so there is no
         # engine object to abort through on those actors.
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
+
+        if not pause_generation:
+            processor = self.engine.output_processor
+            # request_states holds in-flight requests. For sampling n>1 those are
+            # child ids; the ParentRequest lives in parent_requests under the parent
+            # id and is not a request_states key. engine.abort pops that entry only
+            # when the parent id is passed. Children come first: aborting the parent
+            # id first recursively aborts children, and this call has already
+            # detached them from external_req_ids, so the recursive remove throws.
+            request_ids = list(processor.request_states)
+            parent_ids = [
+                parent_id for parent_id in processor.parent_requests if parent_id not in processor.request_states
+            ]
+            await self.engine.abort([*request_ids, *parent_ids], internal=True)
+            return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
         try:
             # Close the gate first, then let admissions already past it land, so the pause
@@ -1534,42 +1531,24 @@ class vLLMReplica(RolloutReplica):
         self,
         reject_request: bool = False,
         reset_prefix_cache: bool = True,
+        pause_generation: bool = True,
     ) -> dict[str, Any]:
-        """Abort all ongoing generation requests across all servers.
+        """Abort in-flight requests on every server.
 
-        Args:
-            reject_request: Fail requests arriving behind the closed gate instead of
-                parking them. See vLLMHttpServer.abort_all_requests().
-            reset_prefix_cache: Clear the prefix/mm caches along with the pause.
-                See vLLMHttpServer.abort_all_requests().
-
-        Returns:
-            dict[str, Any]: Combined abort results from all servers.
+        pause_generation=True (default) also closes admission. See
+        vLLMHttpServer.abort_all_requests(). reset_prefix_cache and
+        reject_request apply only when pausing.
         """
         results = await asyncio.gather(
             *[
                 server.abort_all_requests.remote(
                     reject_request=reject_request,
                     reset_prefix_cache=reset_prefix_cache,
+                    pause_generation=pause_generation,
                 )
                 for server in self.servers
             ]
         )
-
-        total_aborted = sum(r.get("aborted_count", 0) for r in results)
-        all_request_ids = []
-        for r in results:
-            all_request_ids.extend(r.get("request_ids", []))
-
-        return {
-            "aborted_count": total_aborted,
-            "request_ids": all_request_ids,
-            "server_results": results,
-        }
-
-    async def abort_requests(self) -> dict[str, Any]:
-        """Abort current engine requests without pausing. See vLLMHttpServer.abort_requests()."""
-        results = await asyncio.gather(*[server.abort_requests.remote() for server in self.servers])
 
         total_aborted = sum(r.get("aborted_count", 0) for r in results)
         all_request_ids = []
