@@ -253,8 +253,10 @@ adds no phase synchronization. The critic engine supports the same option.
 With timing enabled, device synchronization at phase boundaries attributes
 queued work to the correct phase. ``perf/mfu/actor`` remains the whole-update
 MFU; ``perf/mfu/actor_forward_backward`` uses the model forward/backward time.
-``perf/seconds/actor_optimizer`` includes zeroing gradients and optimizer work.
-Critic metrics use the corresponding ``critic`` names.
+``timing_s/actor_optimizer_mean`` includes zeroing gradients and optimizer work.
+``timing_s/actor_forward_backward_mean`` reports the forward/backward interval.
+Both phase durations explicitly average reporting ranks; critic metrics use
+the corresponding ``critic`` names.
 
 These are local synchronized wall intervals. Existing metric aggregation
 reduces reporting ranks; the intervals are not a global maximum over every

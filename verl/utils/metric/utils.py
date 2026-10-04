@@ -26,21 +26,20 @@ def promote_update_phase_metrics(metrics: dict[str, Any], role: str) -> None:
     """Move the forward-backward MFU and phase timings out of the role prefix.
 
     The whole-update MFU stays ``perf/mfu/{role}``. Forward-backward MFU is
-    ``perf/mfu/{role}_forward_backward``. Durations are ``perf/seconds/{role}_forward_backward``
-    and ``perf/seconds/{role}_optimizer``; optimizer work has no model-FLOP estimate.
+    ``perf/mfu/{role}_forward_backward``. Durations are ``timing_s/{role}_forward_backward_mean``
+    and ``timing_s/{role}_optimizer_mean``; optimizer work has no model-FLOP estimate.
     Callers that do not emit the split leave the original keys untouched.
     """
     forward_mfu = metrics.pop(f"{role}/mfu_forward_backward", None)
     if forward_mfu is not None:
         metrics[f"perf/mfu/{role}_forward_backward"] = forward_mfu
-    # Avoid a "timing" key: reduce_metrics treats any key containing "min" as a minimum,
-    # and the substring "min" occurs inside "timing".
-    forward_time = metrics.pop(f"{role}/timing_s/forward_backward", None)
-    if forward_time is not None:
-        metrics[f"perf/seconds/{role}_forward_backward"] = forward_time
-    optimizer_time = metrics.pop(f"{role}/timing_s/optimizer", None)
-    if optimizer_time is not None:
-        metrics[f"perf/seconds/{role}_optimizer"] = optimizer_time
+    # Explicit aggregation avoids the legacy reducer mistaking "timing" for a min key.
+    for phase in ("forward_backward", "optimizer"):
+        seconds = metrics.pop(f"{role}/timing_s/{phase}", None)
+        if seconds is not None:
+            duration = Metric(aggregation=AggregationType.MEAN)
+            duration.extend(seconds if isinstance(seconds, list) else [seconds])
+            metrics[f"timing_s/{role}_{phase}_mean"] = duration
 
 
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:

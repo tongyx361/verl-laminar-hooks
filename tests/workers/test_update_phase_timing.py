@@ -147,8 +147,8 @@ def test_promote_update_phase_metrics_keeps_whole_update_mfu():
 
     assert reduced["perf/mfu/actor"] == pytest.approx(0.06)
     assert reduced["perf/mfu/actor_forward_backward"] == pytest.approx(0.09)
-    assert reduced["perf/seconds/actor_forward_backward"] == pytest.approx(11.0)
-    assert reduced["perf/seconds/actor_optimizer"] == pytest.approx(4.0)
+    assert reduced["timing_s/actor_forward_backward_mean"] == pytest.approx(11.0)
+    assert reduced["timing_s/actor_optimizer_mean"] == pytest.approx(4.0)
     assert "actor/mfu_forward_backward" not in reduced
 
 
