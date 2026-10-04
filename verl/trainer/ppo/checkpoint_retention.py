@@ -206,6 +206,12 @@ class CheckpointRetention:
 
     def load(self, current_step: int) -> None:
         """Restore persisted state; entries after ``current_step`` are dropped because those steps will re-run."""
+        tracker_step = self._tracker_step()
+        if self.enabled and self.async_save and tracker_step is not None and tracker_step > current_step:
+            raise ValueError(
+                "Asynchronous checkpoint retention cannot resume behind the durability tracker; "
+                "use synchronous saving or a fresh checkpoint directory for rollback"
+            )
         self.start_step = current_step
         if not os.path.exists(self.registry_path):
             return

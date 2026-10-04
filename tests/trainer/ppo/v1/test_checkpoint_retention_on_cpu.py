@@ -362,3 +362,35 @@ def test_disabled_retention_accepts_active_async_critic_config(tmp_path):
     config.critic = {"enable": True, "checkpoint": {"async_save": True}}
     config.algorithm = {"adv_estimator": "gae"}
     assert not build_checkpoint_retention(config).enabled
+
+
+@pytest.mark.parametrize("enabled,async_save", [(True, True), (True, False), (False, True)])
+def test_rollback_behind_tracker_fails_only_for_enabled_async_retention(tmp_path, enabled, async_save):
+    config = _config(tmp_path, {"enable": enabled, "keep_last": 2})
+    config.actor_rollout_ref.actor.checkpoint.async_save = async_save
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("100")
+    policy = build_checkpoint_retention(config)
+    before = sorted(tmp_path.iterdir())
+    if enabled and async_save:
+        with pytest.raises(ValueError, match="cannot resume behind the durability tracker"):
+            policy.load(current_step=10)
+        assert not policy.records
+        assert policy.start_step == 0
+    else:
+        policy.load(current_step=10)
+        assert policy.start_step == 10
+    # Loading/rejecting does not rewind another run's completion marker or write a new checkpoint.
+    assert tracker.read_text() == "100"
+    assert sorted(tmp_path.iterdir()) == before
+
+
+@pytest.mark.parametrize("tracker_step", [None, 10, 5])
+def test_async_retention_accepts_resume_without_future_tracker(tmp_path, tracker_step):
+    config = _config(tmp_path, {"keep_last": 2})
+    config.actor_rollout_ref.actor.checkpoint.async_save = True
+    if tracker_step is not None:
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text(str(tracker_step))
+    policy = build_checkpoint_retention(config)
+    policy.load(current_step=10)
+    assert policy.start_step == 10
