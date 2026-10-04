@@ -170,3 +170,40 @@ def test_aime26_publisher_variant_keeps_matching_question_and_answer(sources):
     assert row["extra_info"]["problem_number"] == 10
     assert row["prompt"][0]["content"] == raw["problem"] + BOXED_SUFFIX
     assert row["reward_model"]["ground_truth"] == "850"
+
+
+def test_offline_cli_manifest_preserves_source_licenses_and_artifact_hashes(sources, tmp_path, monkeypatch):
+    import json
+    import sys
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from examples.data_preprocess import aime_exam_splits as generator
+
+    specifications = deepcopy(generator.VALIDATION_SOURCES)
+    cache = tmp_path / "sources"
+    for key, specification in specifications.items():
+        path = cache / specification["repo_id"].replace("/", "--") / specification["filename"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(sources[key]), path)
+        specification["bytes"] = path.stat().st_size
+        specification["sha256"] = generator.digest(path)
+    monkeypatch.setattr(generator, "VALIDATION_SOURCES", specifications)
+    output = tmp_path / "prepared"
+    monkeypatch.setattr(sys, "argv", ["aime_exam_splits", "--source-dir", str(cache), "--output-dir", str(output)])
+    generator.main()
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["groups"] == {f"aime{year}-{session}": 15 for year in YEARS for session in SESSIONS}
+    assert manifest["sources"]["aime2024"]["license"] is None
+    assert "pinned dataset card" in manifest["sources"]["aime2024"]["license_status"]
+    assert specifications["aime2024"]["revision"] in manifest["sources"]["aime2024"]["dataset_card_url"]
+    for key, specification in manifest["sources"].items():
+        if key != "aime2024":
+            assert specification["license"] == "cc-by-nc-sa-4.0"
+    for artifact in manifest["artifacts"].values():
+        path = output / Path(artifact["path"]).name
+        assert artifact["sha256"] == generator.digest(path)
+        assert artifact["bytes"] == path.stat().st_size
+        assert pq.read_table(path).num_rows == artifact["rows"]

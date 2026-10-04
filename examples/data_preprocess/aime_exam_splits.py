@@ -46,6 +46,12 @@ AIME2024_SOURCE = {
     "filename": "data/train-00000-of-00001.parquet",
     "sha256": "26139847601a5037c237d5928b195e7260ca8074cf4f264b794af42847f79ccf",
     "bytes": 81670,
+    "license": None,
+    "license_status": "Not declared in the pinned dataset card; no usage rights inferred",
+    "dataset_card_url": (
+        "https://huggingface.co/datasets/HuggingFaceH4/aime_2024/blob/"
+        "2fe88a2f1091d5048c0f36abc874fb997b3dd99a/README.md"
+    ),
 }
 AIME2025_SOURCE = {
     "repo_id": "MathArena/aime_2025",
