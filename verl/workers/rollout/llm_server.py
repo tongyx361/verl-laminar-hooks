@@ -248,6 +248,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         Returns:
             TokenOutput: token output
         """
+        rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        collect_versions = getattr(rollout_config, "collect_behavior_version_metrics", False)
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None
@@ -331,6 +333,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
+            if collect_versions and output.token_ids:
+                final_output.extra_fields.setdefault("behavior_version_segments", []).append(
+                    [global_steps, len(output.token_ids)]
+                )
             if min_global_steps is None:
                 min_global_steps = global_steps
             max_global_steps = global_steps
