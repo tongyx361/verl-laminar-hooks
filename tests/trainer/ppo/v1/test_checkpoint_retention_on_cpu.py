@@ -293,3 +293,26 @@ def test_trainer_save_registers_checkpoint(tmp_path):
     assert sorted(trainer.checkpoint_retention.records) == [10]
     # Worker-side rotation stays disabled so it cannot delete retained shards.
     assert trainer.actor_rollout_wg.save_checkpoint.call_args.kwargs["max_ckpt_to_keep"] is None
+
+
+@pytest.mark.parametrize("durable_step", [None, 10])
+def test_async_retention_preserves_every_pending_save(tmp_path, durable_step):
+    cfg = _config(tmp_path, {"keep_last": 2})
+    cfg.actor_rollout_ref.actor.checkpoint.async_save = True
+    policy = build_checkpoint_retention(cfg)
+    if durable_step is not None:
+        _save(policy, durable_step)
+        policy.on_step_end(durable_step, {METRIC: 1.0})
+    # Several saves can be queued before the worker durability tracker advances.
+    for step in (20, 30, 40, 50):
+        os.makedirs(tmp_path / f"global_step_{step}" / "actor")
+        policy.on_save(step)
+        policy.on_step_end(step, {METRIC: 0.1})
+    assert {20, 30, 40, 50} <= set(_on_disk(tmp_path))
+    for step in (20, 30, 40, 50):
+        assert "pending_save" in policy.keep_reasons()[step]
+    # Once FIFO completion confirms all queued saves, obsolete checkpoints may prune.
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("50")
+    policy.prune()
+    assert 30 not in _on_disk(tmp_path)
+    assert 40 in _on_disk(tmp_path) and 50 in _on_disk(tmp_path)

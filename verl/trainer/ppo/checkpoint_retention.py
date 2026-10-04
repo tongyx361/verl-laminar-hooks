@@ -174,9 +174,10 @@ class CheckpointRetention:
     after every save, and :meth:`on_step_end` once per step that saved or validated.
     """
 
-    def __init__(self, cfg: CheckpointRetentionConfig, root_dir: str):
+    def __init__(self, cfg: CheckpointRetentionConfig, root_dir: str, *, async_save: bool = False):
         self.cfg = cfg
         self.root_dir = root_dir
+        self.async_save = async_save
         self.records: dict[int, CheckpointRecord] = {}
         # (step, score) of every validation seen, used for smoothing.
         self.history: list[tuple[int, float]] = []
@@ -351,6 +352,12 @@ class CheckpointRetention:
         tracker_step = self._tracker_step()
         if tracker_step in self.records:
             add(tracker_step, "resume")
+        if self.async_save:
+            # Megatron queues asynchronous saves in FIFO order; multiple checkpoints
+            # may still be writing. Only the durability tracker confirms completion.
+            for step in self.records:
+                if tracker_step is None or step > tracker_step:
+                    add(step, "pending_save")
 
         chain = self._records_chain()
         if chain:
@@ -389,4 +396,5 @@ def build_checkpoint_retention(config: DictConfig) -> CheckpointRetention:
     root_dir = config.trainer.default_local_dir
     if not os.path.isabs(root_dir):
         root_dir = os.path.join(os.getcwd(), root_dir)
-    return CheckpointRetention(cfg, root_dir)
+    actor_checkpoint = config.actor_rollout_ref.actor.get("checkpoint", {}) or {}
+    return CheckpointRetention(cfg, root_dir, async_save=bool(actor_checkpoint.get("async_save", False)))

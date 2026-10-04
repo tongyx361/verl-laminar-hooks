@@ -443,3 +443,5 @@ No need to convert the model to Megatron dist-checkpoint format.
 
     This may increase CPU memory usage and lead to OOM issues for large models.
     We recommend using the default dp-reshardable format in most cases.
+
+With asynchronous checkpoint saving, every registered step newer than the worker durability tracker is retained until completion, even when more than ``keep_last`` saves are queued. If no tracker exists yet, all registered saves are protected. Once the tracker advances, completed checkpoints follow the configured retention policy.
