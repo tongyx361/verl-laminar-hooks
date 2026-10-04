@@ -45,17 +45,18 @@ def behavior_age_metrics(extra_fields, response_lengths, non_padding, current_ve
             ages[age] = ages.get(age, 0) + count
     prefix = "training/off_policy/"
     result = {
-        prefix + "version_coverage/responses": covered / eligible if eligible else 0.0,
-        prefix + "version_coverage/tokens": covered_tokens / expected_tokens if expected_tokens else 0.0,
+        prefix + "behavior_version/response_coverage": covered / eligible if eligible else 0.0,
+        prefix + "behavior_version/token_coverage": covered_tokens / expected_tokens if expected_tokens else 0.0,
     }
     if covered_tokens:
         result.update(
             {
-                prefix + "token_age/mean": sum(age * count for age, count in ages.items()) / covered_tokens,
-                prefix + "token_age/max": max(ages),
-                prefix + "token_age/min": min(ages),
-                prefix + "token_age/stale_fraction": sum(n for age, n in ages.items() if age > 0) / covered_tokens,
-                prefix + "cross_version_response_fraction": cross_version / covered,
+                prefix + "token_staleness/mean": sum(age * count for age, count in ages.items()) / covered_tokens,
+                prefix + "token_staleness/max": max(ages),
+                prefix + "token_staleness/min": min(ages),
+                prefix + "token_staleness/stale_fraction": sum(n for age, n in ages.items() if age > 0)
+                / covered_tokens,
+                prefix + "behavior_version/cross_version_response_fraction": cross_version / covered,
             }
         )
     return result

@@ -51,8 +51,8 @@ async def test_real_client_tracks_only_new_tokens_across_versions(monkeypatch, e
     if enabled:
         assert output.extra_fields["behavior_version_segments"] == [[0, 2], [2, 1]]
         metrics = behavior_age_metrics([output.extra_fields], [3], [True], 2)
-        assert metrics["training/off_policy/token_age/mean"] == pytest.approx(4 / 3)
-        assert metrics["training/off_policy/cross_version_response_fraction"] == 1
+        assert metrics["training/off_policy/token_staleness/mean"] == pytest.approx(4 / 3)
+        assert metrics["training/off_policy/behavior_version/cross_version_response_fraction"] == 1
     else:
         assert "behavior_version_segments" not in output.extra_fields
 
@@ -69,5 +69,5 @@ async def test_missing_server_version_reduces_coverage(monkeypatch):
     client = llm_server.FullyAsyncLLMServerClient(config=config, load_balancer_handle=None)
     output = await client.generate("request", prompt_ids=[1], sampling_params={"max_tokens": 2})
     result = behavior_age_metrics([output.extra_fields], [1], [True], 2)
-    assert result["training/off_policy/version_coverage/responses"] == 0
-    assert not any("token_age" in key for key in result)
+    assert result["training/off_policy/behavior_version/response_coverage"] == 0
+    assert not any("token_staleness" in key for key in result)
