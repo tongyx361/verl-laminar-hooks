@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from verl.utils.metric.partial_rollout import partial_rollout_metrics
+from verl.utils.metric.partial_rollout import partial_rollout_metrics, read_partial_rollout_fields
 from verl.workers.rollout.partial_metrics import engine_prefill_timing, summarize_partial_attempts
 
 
@@ -36,7 +36,7 @@ def test_partial_aggregation_preserves_unavailable_and_excludes_padding():
     fields = [{"partial_rollout": resumed}, {"partial_rollout": plain}, {}, {"partial_rollout": resumed}]
     result = partial_rollout_metrics(fields, [True, True, True, False])
     p = "training/partial_rollout/"
-    assert result[p + "coverage"] == pytest.approx(2 / 3)
+    assert result[p + "response_coverage"] == pytest.approx(2 / 3)
     assert result[p + "abort_count"] == result[p + "resume_count"] == 2
     assert result[p + "empty_abort_count"] == 1
     assert result[p + "resumed_response_fraction"] == 0.5
@@ -48,3 +48,33 @@ def test_partial_aggregation_preserves_unavailable_and_excludes_padding():
     complete = summarize_partial_attempts([attempt(0, 2, True, available), attempt(2, 3, False, available)])
     assert complete["resume_prefill_available"] is True
     assert complete["resume_prefill_observed_seconds"] == 2.5
+
+
+@pytest.mark.parametrize("partition", ["train", "training-custom"])
+def test_optional_observations_preserve_partition_and_missing_row_coverage(partition):
+    import numpy as np
+
+    record = {"partial_rollout": summarize_partial_attempts([])}
+    calls = []
+
+    def read(*, keys, partition_id, select_fields):
+        assert partition_id == partition
+        assert select_fields == ["extra_fields"]
+        calls.append(keys)
+        if len(keys) > 1 or keys == ["old"]:
+            raise ValueError("Some fields are not ready in all the requested keys!")
+        return {"extra_fields": np.array([record], dtype=object)}
+
+    observations = read_partial_rollout_fields(["new", "old"], partition, read)
+    assert calls == [["new", "old"], ["new"], ["old"]]
+    metrics = partial_rollout_metrics(observations, [True, True])
+    assert metrics["training/partial_rollout/response_coverage"] == 0.5
+    assert metrics["training/partial_rollout/abort_count"] == 0
+
+
+def test_optional_observations_propagate_unrelated_queue_error():
+    def read(**kwargs):
+        raise ValueError("partition does not exist")
+
+    with pytest.raises(ValueError, match="partition does not exist"):
+        read_partial_rollout_fields(["new"], "training-custom", read)

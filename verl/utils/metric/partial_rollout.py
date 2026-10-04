@@ -14,7 +14,7 @@ def partial_rollout_metrics(extra_fields, non_padding):
     eligible = [extra for extra, active in zip(extra_fields, non_padding, strict=True) if active]
     records = [extra["partial_rollout"] for extra in eligible if isinstance(extra, dict) and "partial_rollout" in extra]
     prefix = "training/partial_rollout/"
-    result = {prefix + "coverage": len(records) / len(eligible) if eligible else 0.0}
+    result = {prefix + "response_coverage": len(records) / len(eligible) if eligible else 0.0}
     if not records:
         return result
     for field in ("abort_count", "empty_abort_count", "resume_count", "retained_prefix_resume_count"):
@@ -31,4 +31,29 @@ def partial_rollout_metrics(extra_fields, non_padding):
         result[prefix + "resume_prefill_observed_seconds"] = sum(
             r["resume_prefill_observed_seconds"] or 0 for r in records
         )
+    return result
+
+
+def read_partial_rollout_fields(keys, partition_id, kv_batch_get):
+    """Read optional provenance, retaining coverage for rows from older runs."""
+    if not keys:
+        return []
+    try:
+        data = kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["extra_fields"])
+        values = data.get("extra_fields")
+        return values.tolist() if values is not None else [None] * len(keys)
+    except ValueError as exc:
+        if "extra_fields" not in str(exc) and str(exc) != "Some fields are not ready in all the requested keys!":
+            raise
+    # A missing field in one row must not hide provenance in the other rows.
+    result = []
+    for key in keys:
+        try:
+            data = kv_batch_get(keys=[key], partition_id=partition_id, select_fields=["extra_fields"])
+            values = data.get("extra_fields")
+            result.append(values.tolist()[0] if values is not None else None)
+        except ValueError as exc:
+            if "extra_fields" not in str(exc) and str(exc) != "Some fields are not ready in all the requested keys!":
+                raise
+            result.append(None)
     return result
