@@ -1,6 +1,6 @@
 # V1 Async Trainer
 
-Last updated: 09/21/2026.
+Last updated: 10/04/2026.
 
 The V1 trainer provides two asynchronous PPO training modes under the standard `verl.trainer.main_ppo` entry point:
 
@@ -326,3 +326,14 @@ https://github.com/Begunner/verl-link/blob/main/v1_trainer/switch_timing_compone
 
 ![switch_offpolicy](
 https://github.com/Begunner/verl-link/blob/main/v1_trainer/switch_offpolicy.png?raw=true)
+
+
+## Optional partial rollout observations
+
+Set `actor_rollout_ref.rollout.collect_partial_rollout_metrics=true` to record generation attempts, empty aborts, retained-prefix resumes and raw backend termination reasons. The default is `false`; it adds no attempt records or TransferQueue reads for these metrics. This option observes the existing retry and response-budget behavior without changing generated tokens, log probabilities or routing records.
+
+The v1 trainer reports `training/partial_rollout/coverage` over consumed, nonpadding trajectories. Abort and resume counts cover those trajectories only, so they exclude work on subsequently evicted trajectories. Backend `finish_reason` and `stop_reason` are retained separately from the client's cumulative response budget: a native stop coinciding with that budget remains a native stop in the observation record even when the client returns `length`.
+
+On vLLM versions exposing `RequestOutput.metrics.scheduled_ts` and `first_token_ts`, prefill seconds are the wall interval between initial scheduling and the first token, including any preemption during that interval. To expose these timestamps, use `actor_rollout_ref.rollout.disable_log_stats=false`. Missing or invalid timestamps, including empty aborts before the first token, remain unavailable rather than becoming zero latency. `resume_prefill_coverage` describes which resume attempts have measured intervals; `resume_prefill_observed_seconds` sums only measured intervals and is omitted from trainer metrics when none were observed. These per-request intervals are not GPU compute time or GPU-hours.
+
+The initial implementation collects raw backend details from vLLM. Other backends can still contribute client attempt counts; unavailable backend details and prefill intervals remain explicitly unmeasured.
