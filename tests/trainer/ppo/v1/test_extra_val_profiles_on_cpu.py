@@ -83,12 +83,14 @@ class _FakeTQ:
     def __init__(self):
         self.uid = None
         self.cleared = []
+        self.data_source = "aime2024"
 
     def kv_batch_put(self, keys, partition_id, tags):
         assert partition_id == "val"
         self.uid = keys[0]
 
     def kv_batch_get(self, keys, partition_id, select_fields):
+        assert partition_id == "val"
         if select_fields == ["prompts", "responses"]:
             return {
                 "prompts": _FakeNested(torch.tensor([[1], [1]])),
@@ -99,15 +101,18 @@ class _FakeTQ:
             "rm_scores": torch.tensor([[1.0], [0.0]]),
             "num_turns": np.array([2, 2]),
             "reward_model": np.array([{"ground_truth": "7"}] * 2, dtype=object),
-            "data_source": np.array(["aime2024"] * 2, dtype=object),
+            "data_source": np.array([self.data_source] * 2, dtype=object),
         }
 
     def kv_clear(self, keys, partition_id):
+        assert partition_id == "val"
         self.cleared.extend(keys)
 
 
-def test_validate_profile_sends_sampling_overrides_and_suffixes_metrics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("data_source", ["aime2024", "aime2024_train_sampling"])
+def test_validate_profile_namespaces_core_and_aux_metrics(monkeypatch, tmp_path, data_source):
     fake_tq = _FakeTQ()
+    fake_tq.data_source = data_source
     monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.tq", fake_tq)
     generated, dumps, logged = [], [], []
 
@@ -139,8 +144,11 @@ def test_validate_profile_sends_sampling_overrides_and_suffixes_metrics(monkeypa
     metrics = PPOTrainer._validate_profile(trainer, profile="train_sampling", val_sampling=TRAIN_SAMPLING)
 
     assert generated[0]["val_sampling"] == TRAIN_SAMPLING
-    assert metrics["val-core/aime2024_train_sampling/reward/mean@2"] == pytest.approx(0.5)
+    assert metrics[f"val-core/profiles/train_sampling/{data_source}/reward/mean@2"] == pytest.approx(0.5)
     assert not any(key.startswith("val-core/aime2024/") for key in metrics)
+    assert metrics["val-aux/profiles/train_sampling/num_turns/mean"] == 2
+    assert "val-aux/num_turns/mean" not in metrics
+    profile_metrics = metrics.copy()
     assert dumps == [str(tmp_path / "train_sampling")]
     assert logged == []
     assert fake_tq.cleared == [f"{fake_tq.uid}_0_0", f"{fake_tq.uid}_1_0"]
@@ -150,6 +158,8 @@ def test_validate_profile_sends_sampling_overrides_and_suffixes_metrics(monkeypa
     metrics = PPOTrainer._validate_profile(trainer, profile=None, val_sampling=None)
 
     assert "val_sampling" not in generated[0]
-    assert metrics["val-core/aime2024/reward/mean@2"] == pytest.approx(0.5)
+    assert metrics[f"val-core/{data_source}/reward/mean@2"] == pytest.approx(0.5)
     assert dumps == [str(tmp_path)]
     assert len(logged) == 1
+    assert metrics["val-aux/num_turns/mean"] == 2
+    assert not set(profile_metrics).intersection(metrics)

@@ -1214,19 +1214,22 @@ class PPOTrainer(ABC):
                 dump_path=val_data_dir,
             )
 
-        # Reward scoring above already used the original data sources; only metric keys are suffixed.
-        if profile is not None:
-            data_sources = [f"{data_source}_{profile}" for data_source in data_sources]
-            expected_acc_counts = {
-                (f"{data_source}_{profile}", uid): count for (data_source, uid), count in expected_acc_counts.items()
-            }
-        return self._val_metrics_update(
+        # Preserve data-source identities for scoring and metric aggregation.
+        metrics = self._val_metrics_update(
             data_sources,
             sample_uids,
             reward_extra_infos_dict,
             sample_turns,
             expected_acc_counts=expected_acc_counts,
         )
+        if profile is None:
+            return metrics
+        # Namespace every validation metric, including data-source-independent auxiliaries.
+        return {
+            f"{section}/profiles/{profile}/{name}": value
+            for key, value in metrics.items()
+            for section, name in [key.split("/", 1)]
+        }
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""

@@ -50,7 +50,7 @@ EXTRA_VAL_SAMPLING_KEYS = ("temperature", "top_p", "top_k")
 def validate_extra_val_kwargs(extra_val_kwargs) -> None:
     """Check ``rollout.extra_val_kwargs``: profile name -> sampling-key overrides.
 
-    Profile names become metric-key and dump-directory suffixes, so they must be plain identifiers.
+    Profile names become metric-key namespace components and dump-directory names, so they must be plain identifiers.
     """
     for name, overrides in (extra_val_kwargs or {}).items():
         if not isinstance(name, str) or not name.isidentifier():
@@ -223,7 +223,7 @@ class RolloutConfig(BaseConfig):
     # Additional named validation passes run after the ``val_kwargs`` pass on the same prompts,
     # e.g. ``{"train_sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": -1}}``. Each profile
     # overrides only these sampling keys (``n`` and ``do_sample`` follow ``val_kwargs``) and reports
-    # metrics under ``<data_source>_<profile>``. Only the v1 trainer honors this field.
+    # metrics under ``val-core/profiles/<profile>/<data_source>/...``. Only the v1 trainer honors this field.
     extra_val_kwargs: dict = field(default_factory=dict)
 
     max_model_len: Optional[int] = None
