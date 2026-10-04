@@ -150,6 +150,16 @@ def validate_checkpoint_retention_config(config: DictConfig) -> CheckpointRetent
     if trainer_cfg.get("remove_previous_ckpt_in_save", False):
         raise ValueError("trainer.remove_previous_ckpt_in_save conflicts with trainer.checkpoint_retention")
 
+    critic_cfg = config.get("critic", {}) or {}
+    critic_ckpt_cfg = critic_cfg.get("checkpoint", {}) or {}
+    if critic_ckpt_cfg.get("async_save", False):
+        from verl.trainer.ppo.utils import need_critic
+
+        if need_critic(config):
+            # Actor and critic finalize independently and update the same tracker.
+            # An actor durability marker therefore cannot confirm critic completion.
+            raise ValueError("trainer.checkpoint_retention requires synchronous critic checkpoint saving")
+
     # With async saves the newest checkpoint may still be in flight, so the
     # previous one has to survive until it is durable.
     actor_ckpt_cfg = config.actor_rollout_ref.actor.get("checkpoint", {}) or {}

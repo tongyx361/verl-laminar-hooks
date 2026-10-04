@@ -445,3 +445,5 @@ No need to convert the model to Megatron dist-checkpoint format.
     We recommend using the default dp-reshardable format in most cases.
 
 With asynchronous checkpoint saving, every registered step newer than the worker durability tracker is retained until completion, even when more than ``keep_last`` saves are queued. If no tracker exists yet, all registered saves are protected. Once the tracker advances, completed checkpoints follow the configured retention policy.
+
+Score-aware retention requires synchronous critic checkpoint saving when the critic is enabled (including automatic critic use with GAE). Set ``critic.checkpoint.async_save=false``. Actor and critic asynchronous writers finalize independently and share one tracker, which cannot establish joint durability; active asynchronous critic saving is therefore rejected while this policy is enabled. An unused critic configuration is unaffected.

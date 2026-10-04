@@ -316,3 +316,49 @@ def test_async_retention_preserves_every_pending_save(tmp_path, durable_step):
     policy.prune()
     assert 30 not in _on_disk(tmp_path)
     assert 40 in _on_disk(tmp_path) and 50 in _on_disk(tmp_path)
+
+
+@pytest.mark.parametrize("actor_async", [False, True])
+@pytest.mark.parametrize("critic_enable,adv_estimator", [(None, "gae"), (True, "grpo")])
+def test_retention_rejects_active_async_critic_from_composed_config(actor_async, critic_enable, adv_estimator):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    from verl.trainer.ppo.utils import need_critic
+
+    config_dir = str(Path(__file__).resolve().parents[4] / "verl/trainer/config")
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        config = compose(
+            config_name="ppo_trainer",
+            overrides=[
+                "model_engine=megatron",
+                f"algorithm.adv_estimator={adv_estimator}",
+                "critic.enable=" + ("null" if critic_enable is None else "true"),
+                "critic.checkpoint.async_save=true",
+                f"actor_rollout_ref.actor.checkpoint.async_save={str(actor_async).lower()}",
+                "trainer.checkpoint_retention.enable=true",
+                "trainer.checkpoint_retention.keep_last=2",
+                "trainer.checkpoint_retention.metric=[val-core/example/acc/mean@32]",
+                "trainer.test_freq=10",
+                "trainer.save_freq=10",
+            ],
+        )
+    assert need_critic(config)
+    assert config.critic.strategy == "megatron"
+    with pytest.raises(ValueError, match="synchronous critic"):
+        build_checkpoint_retention(config)
+
+
+def test_retention_allows_unused_async_critic_config(tmp_path):
+    config = _config(tmp_path)
+    config.critic = {"enable": False, "checkpoint": {"async_save": True}}
+    config.algorithm = {"adv_estimator": "gae"}
+    assert build_checkpoint_retention(config).enabled
+
+
+def test_disabled_retention_accepts_active_async_critic_config(tmp_path):
+    config = _config(tmp_path, {"enable": False})
+    config.critic = {"enable": True, "checkpoint": {"async_save": True}}
+    config.algorithm = {"adv_estimator": "gae"}
+    assert not build_checkpoint_retention(config).enabled
