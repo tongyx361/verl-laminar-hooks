@@ -326,3 +326,20 @@ https://github.com/Begunner/verl-link/blob/main/v1_trainer/switch_timing_compone
 
 ![switch_offpolicy](
 https://github.com/Begunner/verl-link/blob/main/v1_trainer/switch_offpolicy.png?raw=true)
+
+
+## Additional validation sampling profiles
+
+`actor_rollout_ref.rollout.extra_val_kwargs` adds named validation passes after the usual `val_kwargs` pass on the same prompts. This is supported by the v1 trainer and defaults to an empty mapping.
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    extra_val_kwargs:
+      high_temperature:
+        temperature: 1.0
+        top_p: 1.0
+        top_k: -1
+```
+
+Each profile overrides only `temperature`, `top_p`, and `top_k`; `n` and `do_sample` follow `val_kwargs`. Metrics use `<data_source>_<profile>`, while reward dispatch retains the original data source. Generation dumps go into a profile subdirectory. Additional profiles incur additional generation and reward computation.
