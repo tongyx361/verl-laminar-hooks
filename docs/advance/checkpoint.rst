@@ -38,6 +38,55 @@ Megatron:
     For FSDP, ``checkpoint.save_contents`` other than ``hf_model`` are binded together to save and
     load. We recommend to include ``model``, ``optimizer`` and ``extra`` all.
 
+Score-aware Checkpoint Retention
+--------------------------------
+
+``trainer.max_actor_ckpt_to_keep`` rotates checkpoints purely by save order. With
+the v1 trainer, ``trainer.checkpoint_retention`` instead keeps checkpoints by
+their role. Checkpoints are still saved every ``save_freq`` steps; after the
+validation of the same step, only these are kept:
+
+- ``latest``: the ``keep_last`` most recent checkpoints and the one named in
+  ``latest_checkpointed_iteration.txt``, to resume training;
+- ``best``: the highest-scoring checkpoint so far, to restart from when the
+  training dynamics need fixing;
+- ``converged``: the earliest checkpoint whose score is within
+  ``converge_tolerance`` of the best, to study the dynamics before convergence;
+- ``milestone``: sparse rollback points. A checkpoint that sets a new best at
+  least ``milestone_interval`` steps after the previous milestone (or the start
+  of the run) is kept permanently.
+
+``best``, ``converged`` and ``milestone`` are always checkpoints that beat every earlier
+checkpoint when they were scored. As the best score rises, such checkpoints that
+fall more than ``converge_tolerance`` below it can never become ``converged``
+again and are deleted; the ones still inside the band are kept as candidates
+(``converge_candidate``). The early fast rise therefore leaves no checkpoints
+behind. Scores can be averaged over the last ``window`` validation points so a
+single lucky evaluation does not define the best.
+
+.. code:: yaml
+
+    trainer:
+      save_freq: 80
+      test_freq: 40            # save_freq must be a multiple of test_freq to score every checkpoint
+      max_actor_ckpt_to_keep: null
+      checkpoint_retention:
+        enable: true
+        metric: [val-core/aime24/acc/mean@32, val-core/aime25/acc/mean@32]  # score = mean
+        keep_last: 1
+        window: 2
+        converge_tolerance: 0.02
+        milestone_interval: 400
+
+Scores and decisions persist in ``<default_local_dir>/checkpoint_retention.json``
+and are logged under ``checkpoint_retention/*`` (including ``best_step``,
+``converged_step`` and ``is_milestone``). Only checkpoints registered in that file are deleted;
+directories from other runs or written before the policy was enabled are never
+touched. Deletion runs on the driver, so ``default_local_dir`` must be on a
+filesystem the driver can see; copies under ``default_hdfs_dir`` are not pruned.
+The policy cannot be combined with ``max_actor_ckpt_to_keep``/``max_critic_ckpt_to_keep``,
+and needs ``keep_last >= 2`` with asynchronous saving.
+
 Checkpoint Callback
 -------------------
 
