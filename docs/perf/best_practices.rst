@@ -241,3 +241,31 @@ Trainer
     Number of validation samples stored in logs. Start with 10 and adjust as needed.
   - ``trainer.val_before_train``:
     Run validation before training begins when you require a baseline checkpoint.
+
+
+Opt-in Update Phase Timing
+--------------------------
+
+Set ``actor_rollout_ref.actor.engine.enable_update_phase_timing=true`` to report
+forward/backward and optimizer wall times separately. The default is false and
+adds no phase synchronization. The critic engine supports the same option.
+
+With timing enabled, device synchronization at phase boundaries attributes
+queued work to the correct phase. ``perf/mfu/actor`` remains the whole-update
+MFU; ``perf/mfu/actor_forward_backward`` uses the model forward/backward time.
+``perf/seconds/actor_optimizer`` includes zeroing gradients and optimizer work.
+Critic metrics use the corresponding ``critic`` names.
+
+These are local synchronized wall intervals. Existing metric aggregation
+reduces reporting ranks; the intervals are not a global maximum over every
+rank and must not be subtracted from driver RPC time to infer transfer cost.
+Synchronization can affect overlap, so enable it for diagnosis and compare
+performance with the same timing setting.
+
+The v1 colocated async trainer also records host wall intervals for
+``group_wait``, ``rollout_abort``, ``rollout_sleep``, ``weight_sync`` and
+``rollout_resume``. Existing aggregate ``gen`` and ``update_weights`` timers
+remain available; nested intervals must not be added to their parents.
+``weight_sync`` includes backend wake/load/offload work, not only transport.
+VeOmni reports its completed backward batch's microbatch count. These host
+timers and the count do not add device synchronization.

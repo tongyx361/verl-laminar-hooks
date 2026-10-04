@@ -204,6 +204,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
+        # Phase timers are local wall times. allgather would wrap the floats in a list and break
+        # the micro-batch flattener, which iterates each gathered value.
+        forward_backward_seconds = metrics.pop("timing_s/forward_backward", None)
+        optimizer_seconds = metrics.pop("timing_s/optimizer", None)
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:
@@ -231,9 +235,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
                 global_token_num, delta_time, images_seqlens=images_seqlens
             )
-            final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
+            world_size = torch.distributed.get_world_size()
+            final_metrics["mfu"] = estimated_flops / promised_flops / world_size
             if forward_only:
                 final_metrics["mfu"] /= 3.0
+            # Same token FLOPs as mfu, with optimizer and zero_grad removed from the denominator.
+            if forward_backward_seconds is not None and forward_backward_seconds > 0:
+                forward_flops, forward_promised = self.flops_counter.estimate_flops(
+                    global_token_num, forward_backward_seconds, images_seqlens=images_seqlens
+                )
+                final_metrics["mfu_forward_backward"] = forward_flops / forward_promised / world_size
+                if forward_only:
+                    final_metrics["mfu_forward_backward"] /= 3.0
+        if forward_backward_seconds is not None:
+            final_metrics["timing_s/forward_backward"] = forward_backward_seconds
+        if optimizer_seconds is not None:
+            final_metrics["timing_s/optimizer"] = optimizer_seconds
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics
