@@ -204,3 +204,87 @@ def test_colocated_transition_timers_preserve_call_order(monkeypatch):
         ("end", "rollout_resume"),
         ("end", "update_weights"),
     ]
+
+
+def test_phase_rank_means_survive_metadata_only_worker_collection(monkeypatch):
+    from verl.protocol import BatchData
+    from verl.workers import engine_workers
+
+    device = SimpleNamespace(max_memory_allocated=lambda: 0, max_memory_reserved=lambda: 0)
+    monkeypatch.setattr(engine_workers, "get_torch_device", lambda: device)
+    monkeypatch.setattr(engine_workers.psutil, "virtual_memory", lambda: SimpleNamespace(used=0))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    seen = []
+
+    def gather(data, group):
+        assert group == "dp"
+        if not data:
+            return {}
+        seen.append(data)
+        assert set(data) == {"timing_s/forward_backward", "timing_s/optimizer", "mfu_forward_backward"}
+        return {
+            "timing_s/forward_backward": [2.0, 6.0],
+            "timing_s/optimizer": [1.0, 3.0],
+            "mfu_forward_backward": [3.0, 1.0],
+        }
+
+    monkeypatch.setattr(engine_workers, "allgather_dict_into_dict", gather)
+    worker = SimpleNamespace(
+        engine=SimpleNamespace(get_data_parallel_group=lambda: "dp"), flops_counter=_Flops(), device_name="cpu"
+    )
+    outputs = []
+    for forward, optimizer in [(2.0, 1.0), (6.0, 3.0)]:
+        raw = {
+            "metrics": {"timing_s/forward_backward": forward, "timing_s/optimizer": optimizer},
+            "loss": [1.0],
+            "model_output": {},
+        }
+        outputs.append(
+            TrainingWorker._postprocess_output(
+                worker, raw, global_token_num=[8, 8], delta_time=8.0, forward_only=False, images_seqlens=None
+            )
+        )
+    # The real collector drops later metadata-only TensorDicts. All reporting
+    # ranks must therefore carry the same already-aggregated phase observations.
+    collected = BatchData(outputs).concat()
+    collected_metrics = tu.get(collected, "metrics")
+    assert collected_metrics["timing_s/forward_backward"] == 4.0
+    assert collected_metrics["timing_s/optimizer"] == 2.0
+    assert collected_metrics["mfu_forward_backward"] == 2.0
+    assert len(seen) == 2
+    assert seen[0]["timing_s/forward_backward"] == 2.0
+    assert seen[1]["timing_s/forward_backward"] == 6.0
+    promoted = {"actor/" + key: [value] for key, value in collected_metrics.items()}
+    promote_update_phase_metrics(promoted, "actor")
+    reduced = reduce_metrics(promoted)
+    assert reduced["timing_s/actor_forward_backward_mean"] == 4.0
+    assert reduced["timing_s/actor_optimizer_mean"] == 2.0
+    assert reduced["perf/mfu/actor_forward_backward"] == 2.0
+
+
+def test_default_worker_path_adds_no_phase_collective(monkeypatch):
+    from verl.workers import engine_workers
+
+    device = SimpleNamespace(max_memory_allocated=lambda: 0, max_memory_reserved=lambda: 0)
+    monkeypatch.setattr(engine_workers, "get_torch_device", lambda: device)
+    monkeypatch.setattr(engine_workers.psutil, "virtual_memory", lambda: SimpleNamespace(used=0))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    calls = []
+
+    def gather(data, group):
+        calls.append(data.copy())
+        return {}
+
+    monkeypatch.setattr(engine_workers, "allgather_dict_into_dict", gather)
+    worker = SimpleNamespace(
+        engine=SimpleNamespace(get_data_parallel_group=lambda: "dp"), flops_counter=_Flops(), device_name="cpu"
+    )
+    raw = {"metrics": {}, "loss": [1.0], "model_output": {}}
+    output = TrainingWorker._postprocess_output(
+        worker, raw, global_token_num=[8, 8], delta_time=8.0, forward_only=False, images_seqlens=None
+    )
+    assert calls == [{}]  # Only the existing ordinary-metric collective.
+    assert "mfu_forward_backward" not in tu.get(output, "metrics")
+    assert "timing_s/forward_backward" not in tu.get(output, "metrics")

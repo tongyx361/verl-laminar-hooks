@@ -230,6 +230,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if k.startswith("mtp_losses"):
                 flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
                 final_metrics[k] = sum(flatten_v) / len(flatten_v)
+        phase_metrics = {}
         # compute mfu
         if global_token_num is not None and self.flops_counter is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
@@ -244,13 +245,20 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 forward_flops, forward_promised = self.flops_counter.estimate_flops(
                     global_token_num, forward_backward_seconds, images_seqlens=images_seqlens
                 )
-                final_metrics["mfu_forward_backward"] = forward_flops / forward_promised / world_size
+                phase_metrics["mfu_forward_backward"] = forward_flops / forward_promised / world_size
                 if forward_only:
-                    final_metrics["mfu_forward_backward"] /= 3.0
+                    phase_metrics["mfu_forward_backward"] /= 3.0
         if forward_backward_seconds is not None:
-            final_metrics["timing_s/forward_backward"] = forward_backward_seconds
+            phase_metrics["timing_s/forward_backward"] = forward_backward_seconds
         if optimizer_seconds is not None:
-            final_metrics["timing_s/optimizer"] = optimizer_seconds
+            phase_metrics["timing_s/optimizer"] = optimizer_seconds
+        if phase_metrics and dp_group is not None:
+            # Metadata-only TensorDict collection keeps the first reporting rank.
+            # Reduce local scalar observations across DP first, leaving scalars
+            # for the mini-batch flattener rather than nested lists of floats.
+            gathered = allgather_dict_into_dict(data=phase_metrics, group=dp_group)
+            phase_metrics = {key: sum(values) / len(values) for key, values in gathered.items()}
+        final_metrics.update(phase_metrics)
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics

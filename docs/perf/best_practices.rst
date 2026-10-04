@@ -255,7 +255,9 @@ queued work to the correct phase. ``perf/mfu/actor`` remains the whole-update
 MFU; ``perf/mfu/actor_forward_backward`` uses the model forward/backward time.
 ``timing_s/actor_optimizer_mean`` includes zeroing gradients and optimizer work.
 ``timing_s/actor_forward_backward_mean`` reports the forward/backward interval.
-Both phase durations explicitly average reporting ranks; critic metrics use
+Both phase durations explicitly average reporting DP ranks before metadata
+collection and then average update mini-batches. Forward/backward MFU averages
+the per-rank ratios over the same reporting ranks; critic metrics use
 the corresponding ``critic`` names.
 
 These are local synchronized wall intervals. Existing metric aggregation
@@ -269,5 +271,8 @@ The v1 colocated async trainer also records host wall intervals for
 ``rollout_resume``. Existing aggregate ``gen`` and ``update_weights`` timers
 remain available; nested intervals must not be added to their parents.
 ``weight_sync`` includes backend wake/load/offload work, not only transport.
-VeOmni reports its completed backward batch's microbatch count. These host
+VeOmni reports its completed backward batch's microbatch count under
+``actor/perf/micro_batch_count``. The ordinary metric path averages this count
+over reporting DP ranks and update mini-batches; it is not a sum over the
+cluster and does not count duplicate sequence/model-parallel work. These host
 timers and the count do not add device synchronization.
