@@ -874,6 +874,8 @@ def compute_best_worst_at_k(data: list[float], subset_size: int) -> list[tuple[f
         raise ValueError("subset_size must be between 1 and len(data)")
 
     values = np.sort(np.asarray(data, dtype=np.float64))
+    if subset_size == len(values):
+        return [(float(values[-1]), 0.0), (float(values[0]), 0.0)]
     # Start at P(max rank = n) = k/n and recurse downward to avoid large binomial coefficients.
     weights = np.zeros(len(values), dtype=np.float64)
     weights[-1] = subset_size / len(values)
