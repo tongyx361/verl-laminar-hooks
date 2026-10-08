@@ -289,6 +289,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         num_cached_tokens = None
 
         while True:
+            # Restored partial responses keep collecting their existing provenance
+            # even when the new run disables collection for fresh responses.
+            collect_versions = collect_versions or bool(final_output.extra_fields.get("behavior_version_segments"))
             # 1. generate tokens
             output = await super().generate(
                 request_id=request_id,
