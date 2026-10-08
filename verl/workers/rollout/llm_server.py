@@ -287,9 +287,16 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         num_cached_tokens = None
         rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
         collect_metrics = bool(getattr(rollout_config, "collect_partial_rollout_metrics", False))
-        partial_attempts = [] if collect_metrics else None
+        partial_attempts = None
 
         while True:
+            if partial_attempts is None:
+                # Keep history inside TokenOutput so a partial checkpoint can
+                # serialize it together with the retained prefix.
+                partial_attempts = final_output.extra_fields.get("partial_attempts", [])
+                collect_metrics = collect_metrics or bool(partial_attempts)
+                if collect_metrics:
+                    final_output.extra_fields["partial_attempts"] = partial_attempts
             # 1. generate tokens
             output = await super().generate(
                 request_id=request_id,
@@ -372,7 +379,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
-        if collect_metrics:
+        # A restored complete session can skip the loop entirely. Missing
+        # attempt history remains unobserved rather than an empty observation.
+        partial_attempts = partial_attempts or final_output.extra_fields.get("partial_attempts", [])
+        if partial_attempts:
             from verl.workers.rollout.partial_metrics import summarize_partial_attempts
 
             final_output.extra_fields["partial_rollout"] = summarize_partial_attempts(partial_attempts)

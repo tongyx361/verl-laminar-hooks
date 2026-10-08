@@ -78,3 +78,47 @@ def test_optional_observations_propagate_unrelated_queue_error():
 
     with pytest.raises(ValueError, match="partition does not exist"):
         read_partial_rollout_fields(["new"], "training-custom", read)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_client_retains_attempt_history_with_output_for_checkpointing(monkeypatch, enabled):
+    from verl.workers.rollout import llm_server
+    from verl.workers.rollout.replica import TokenOutput
+
+    outputs = iter(
+        [
+            TokenOutput(token_ids=[3, 4], stop_reason="aborted", extra_fields={"global_steps": 7}),
+            TokenOutput(token_ids=[], stop_reason="abort", extra_fields={"global_steps": 8}),
+            TokenOutput(token_ids=[5], stop_reason="stop", extra_fields={"global_steps": 9}),
+        ]
+    )
+
+    async def generate(self, **kwargs):
+        return next(outputs)
+
+    async def no_wait(*args):
+        pass
+
+    monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
+    monkeypatch.setattr(llm_server.asyncio, "sleep", no_wait)
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(collect_partial_rollout_metrics=enabled, response_length=5)
+        )
+    )
+    output = await llm_server.FullyAsyncLLMServerClient(config=config).generate(
+        "request", prompt_ids=[1, 2], sampling_params={"max_tokens": 5}
+    )
+    assert output.token_ids == [3, 4, 5]
+    if enabled:
+        history = output.model_dump()["extra_fields"]["partial_attempts"]
+        assert [attempt["version"] for attempt in history] == [7, 8, 9]
+        assert [attempt["retained_tokens"] for attempt in history] == [0, 2, 2]
+        assert [attempt["new_tokens"] for attempt in history] == [2, 0, 1]
+        assert output.extra_fields["partial_rollout"]["abort_count"] == 2
+        assert output.extra_fields["partial_rollout"]["empty_abort_count"] == 1
+        assert len(output.extra_fields["termination"]["attempts"]) == len(history)
+    else:
+        assert "partial_attempts" not in output.extra_fields
+        assert "partial_rollout" not in output.extra_fields

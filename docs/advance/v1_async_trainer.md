@@ -339,3 +339,5 @@ On vLLM versions exposing `RequestOutput.metrics.scheduled_ts` and `first_token_
 The initial implementation collects raw backend details from vLLM. Other backends can still contribute client attempt counts; unavailable backend details and prefill intervals remain explicitly unmeasured.
 
 Metrics are computed from the consumed training batch's TransferQueue partition, never from validation rows. Older rows without observation fields reduce response coverage and contribute no fabricated counts. Resume fractions use covered responses; resume-prefill coverage uses observed resume attempts divided by all recorded resume attempts. Seconds sum observed request wall intervals for this consumed batch; overlapping requests mean this sum is not elapsed batch latency.
+
+Raw attempt history is stored in the cumulative `TokenOutput.extra_fields`, allowing a partial-rollout checkpoint that serializes the output to retain earlier attempts. Restored history continues to accumulate even if observation is disabled in the new configuration. Completed restored outputs reuse their existing history without adding a new attempt; older checkpoints without history remain unobserved.
