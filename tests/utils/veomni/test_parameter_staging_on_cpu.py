@@ -49,7 +49,13 @@ def exporter(namespace):
 @pytest.mark.parametrize("cpu_policy", [False, True])
 @pytest.mark.parametrize("converter_kind", ["absent", "none", "load_only"])
 def test_cpu_sharded_export_preserves_values_without_whole_model_staging(tmp_path, offload, cpu_policy, converter_kind):
-    torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1)
+    owns_process_group = not torch.distributed.is_initialized()
+    if owns_process_group:
+        torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1)
+    else:
+        # The checkpoint tests can own a single-rank Gloo group for the session.
+        assert torch.distributed.get_backend() == "gloo"
+        assert torch.distributed.get_world_size() == 1
     try:
         mesh = torch.distributed.init_device_mesh("cpu", (1,))
         expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -87,7 +93,8 @@ def test_cpu_sharded_export_preserves_values_without_whole_model_staging(tmp_pat
         assert module.weight.device.type == "cpu"
         forbidden.assert_not_called()
     finally:
-        torch.distributed.destroy_process_group()
+        if owns_process_group:
+            torch.distributed.destroy_process_group()
 
 
 @pytest.mark.parametrize("cpu_policy", [False, True])
