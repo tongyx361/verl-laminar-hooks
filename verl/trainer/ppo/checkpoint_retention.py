@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 RETENTION_REGISTRY_FILENAME = "checkpoint_retention.json"
-_REGISTRY_VERSION = 2
+_REGISTRY_VERSION = 3
 _METRIC_PREFIX = "checkpoint_retention"
 
 
@@ -206,19 +206,34 @@ class CheckpointRetention:
 
     def load(self, current_step: int) -> None:
         """Restore persisted state; entries after ``current_step`` are dropped because those steps will re-run."""
+        if not self.enabled:
+            self.start_step = current_step
+            return
         tracker_step = self._tracker_step()
         if self.enabled and self.async_save and tracker_step is not None and tracker_step > current_step:
             raise ValueError(
                 "Asynchronous checkpoint retention cannot resume behind the durability tracker; "
                 "use synchronous saving or a fresh checkpoint directory for rollback"
             )
-        self.start_step = current_step
         if not os.path.exists(self.registry_path):
+            self.start_step = current_step
             return
         with open(self.registry_path) as f:
             state = json.load(f)
+        if state.get("version") in (1, 2) or "score_policy" not in state:
+            raise ValueError(
+                "Checkpoint retention registry has no score-policy provenance; "
+                "disable retention for this directory or use a fresh checkpoint directory. "
+                "Leave the existing registry and checkpoints intact."
+            )
         if state.get("version") != _REGISTRY_VERSION:
             raise ValueError(f"Unsupported checkpoint retention registry version in {self.registry_path}")
+        if state["score_policy"] != self._score_policy():
+            raise ValueError(
+                "Checkpoint retention score policy changed (metric, mode or window); "
+                "disable retention for this directory or use a fresh checkpoint directory. "
+                "Leave the existing registry and checkpoints intact."
+            )
         self.records = {
             int(r["step"]): CheckpointRecord(**r) for r in state.get("records", []) if int(r["step"]) <= current_step
         }
@@ -226,10 +241,15 @@ class CheckpointRetention:
         self.start_step = min(int(state.get("start_step", current_step)), current_step)
         logger.info(f"Loaded checkpoint retention registry: {len(self.records)} checkpoints, best={self.best_step()}")
 
+    def _score_policy(self) -> dict:
+        """Identify the policy that produced the persisted scores and record flags."""
+        return {"metric": list(self.cfg.metric), "mode": self.cfg.mode, "window": self.cfg.window}
+
     def _persist(self) -> None:
         os.makedirs(self.root_dir, exist_ok=True)
         state = {
             "version": _REGISTRY_VERSION,
+            "score_policy": self._score_policy(),
             "start_step": self.start_step,
             "history": [[s, v] for s, v in self.history],
             "records": [asdict(self.records[s]) for s in sorted(self.records)],

@@ -210,6 +210,7 @@ def test_registry_persists_and_drops_future_steps_on_resume(tmp_path):
 
     with open(tmp_path / RETENTION_REGISTRY_FILENAME) as f:
         state = json.load(f)
+    assert state["score_policy"] == {"metric": [METRIC], "mode": "max", "window": 1}
     assert [r["step"] for r in state["records"]] == [10, 30]
 
     resumed = build_checkpoint_retention(cfg)
@@ -219,6 +220,67 @@ def test_registry_persists_and_drops_future_steps_on_resume(tmp_path):
     _run(resumed, {20: 0.65})
     assert resumed.best_step() == 20
     assert resumed.converged_step() == 10
+
+
+@pytest.mark.parametrize(
+    "changed_policy",
+    [{"mode": "min"}, {"window": 2}, {"metric": "val-core/profiles/high_temperature/aime24/acc/mean@32"}],
+)
+def test_resume_rejects_changed_score_policy_without_writing_or_deleting(tmp_path, changed_policy):
+    policy = build_checkpoint_retention(_config(tmp_path))
+    # Both checkpoints survive, but the old max-policy record flags would select
+    # step 30=.85 and delete the true min-policy best at step 20=.8 after a restart.
+    _run(policy, {10: 0.9, 20: 0.8})
+    registry = tmp_path / RETENTION_REGISTRY_FILENAME
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    before_registry, before_tracker = registry.read_bytes(), tracker.read_bytes()
+    resumed = build_checkpoint_retention(_config(tmp_path, changed_policy))
+
+    with pytest.raises(ValueError, match="score policy changed"):
+        resumed.load(current_step=20)
+
+    assert resumed.records == {} and resumed.history == [] and resumed.start_step == 0
+    assert registry.read_bytes() == before_registry
+    assert tracker.read_bytes() == before_tracker
+    assert _on_disk(tmp_path) == [10, 20]
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_registry_without_score_provenance_is_preserved(tmp_path, version, enabled):
+    policy = build_checkpoint_retention(_config(tmp_path))
+    _run(policy, {10: 0.9, 20: 0.8})
+    registry = tmp_path / RETENTION_REGISTRY_FILENAME
+    state = json.loads(registry.read_text())
+    state["version"] = version
+    state.pop("score_policy")
+    registry.write_text(json.dumps(state))
+    before = registry.read_bytes()
+    resumed = build_checkpoint_retention(_config(tmp_path, {"enable": enabled}))
+
+    if enabled:
+        with pytest.raises(ValueError, match="no score-policy provenance"):
+            resumed.load(current_step=20)
+        assert resumed.start_step == 0
+    else:
+        resumed.load(current_step=20)
+        assert resumed.start_step == 20
+
+    assert resumed.records == {} and resumed.history == []
+    assert registry.read_bytes() == before
+    assert _on_disk(tmp_path) == [10, 20]
+
+
+def test_matching_score_policy_can_resume_with_a_different_keep_last(tmp_path):
+    policy = build_checkpoint_retention(_config(tmp_path))
+    _run(policy, {10: 0.9, 20: 0.8})
+    # The normalized singleton metric list matches the original scalar setting.
+    resumed = build_checkpoint_retention(_config(tmp_path, {"metric": [METRIC], "keep_last": 2}))
+    resumed.load(current_step=20)
+    _run(resumed, {30: 0.85})
+
+    assert resumed.best_step() == 10
+    assert _on_disk(tmp_path) == [10, 20, 30]
 
 
 def test_missing_metric_raises(tmp_path):
