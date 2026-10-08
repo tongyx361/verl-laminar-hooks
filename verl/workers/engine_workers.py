@@ -359,6 +359,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                             )
                     append_to_dict(metrics, output)
 
+                metrics["mini_batches_executed"] = [len(output_lst)]
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
                 output = None

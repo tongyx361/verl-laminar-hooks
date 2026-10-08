@@ -276,3 +276,8 @@ VeOmni reports its completed backward batch's microbatch count under
 over reporting DP ranks and update mini-batches; it is not a sum over the
 cluster and does not count duplicate sequence/model-parallel work. These host
 timers and the count do not add device synchronization.
+
+Across a V1 parameter synchronization cycle, update phase means are weighted by
+``actor/mini_batches_executed`` (or the corresponding critic key), with one update
+as the fallback when that metric is absent. Driver wall intervals continue to sum
+across iterations; phase means must not be summed with those intervals.

@@ -288,3 +288,24 @@ def test_default_worker_path_adds_no_phase_collective(monkeypatch):
     assert calls == [{}]  # Only the existing ordinary-metric collective.
     assert "mfu_forward_backward" not in tu.get(output, "metrics")
     assert "timing_s/forward_backward" not in tu.get(output, "metrics")
+
+
+def test_worker_reports_executed_updates_for_cycle_phase_weighting():
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+
+    data = TensorDict({"sample": torch.arange(8)}, batch_size=[8])
+    tu.assign_non_tensor(data, num_mini_batch=4, epochs=2)
+    worker = SimpleNamespace(
+        engine=SimpleNamespace(
+            get_data_parallel_size=lambda: 1,
+            get_data_parallel_rank=lambda: 0,
+            train_mode=lambda **kwargs: nullcontext(),
+            is_mp_src_rank_with_outputs=lambda: True,
+        ),
+        profiler=MagicMock(),
+        train_batch=lambda batch: tu.get_tensordict({}, {"metrics": {}}),
+    )
+    output = TrainingWorker.train_mini_batch(worker, data)
+    assert tu.get(output, "metrics")["mini_batches_executed"] == [8]
+    assert worker.profiler.step.call_count == 8
