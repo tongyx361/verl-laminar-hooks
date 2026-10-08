@@ -342,6 +342,6 @@ actor_rollout_ref:
         top_k: -1
 ```
 
-Each profile overrides only `temperature`, `top_p`, and `top_k`; `n` and `do_sample` follow `val_kwargs`. Metrics use `val-core/profiles/<profile>/<data_source>/...`, while reward dispatch retains the original data source. Generation dumps go into a profile subdirectory. Additional profiles incur additional generation and reward computation.
+Each profile overrides only `temperature`, `top_p`, and `top_k`; `n` follows `val_kwargs` unless the dataset provides a per-prompt `__rollout_n__`. The v1 trainer selects greedy sampling with `temperature: 0` and does not consult `val_kwargs.do_sample`. A profile with positive temperature therefore samples even when that flag is false. Metrics use `val-core/profiles/<profile>/<data_source>/...`, while reward dispatch retains the original data source. Generation dumps go into a profile subdirectory. Additional profiles incur additional generation and reward computation.
 
 Named profiles also namespace auxiliary metrics as val-aux/profiles/<profile>/..., including turn counts. The default pass retains its existing metric names. All passes use the validation queue partition; reward dispatch and accuracy aggregation retain original data-source identities.

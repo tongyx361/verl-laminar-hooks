@@ -222,8 +222,9 @@ class RolloutConfig(BaseConfig):
 
     # Additional named validation passes run after the ``val_kwargs`` pass on the same prompts,
     # e.g. ``{"train_sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": -1}}``. Each profile
-    # overrides only these sampling keys (``n`` and ``do_sample`` follow ``val_kwargs``) and reports
+    # overrides only these sampling keys (``n`` follows ``val_kwargs``) and reports
     # metrics under ``val-core/profiles/<profile>/<data_source>/...``. Only the v1 trainer honors this field.
+    # V1 selects greedy sampling with temperature=0 and does not consult val_kwargs.do_sample.
     extra_val_kwargs: dict = field(default_factory=dict)
 
     max_model_len: Optional[int] = None
