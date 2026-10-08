@@ -526,8 +526,8 @@ class TestBestWorstAtK(unittest.TestCase):
 
     def test_full_sample_has_zero_std(self):
         self.assertEqual(compute_best_worst_at_k([2, -3, 5, 2], 4), [(5.0, 0.0), (-3.0, 0.0)])
-        for data in ([-1e16, 1.0], [-1e12, 1e-5], [-1.0, 1e16]):
-            with self.subTest(data=data):
+        for data in ([-1e16, 1.0], [-1e12, 1e-5], [-1.0, 1e16], [-1e308, 1e308]):
+            with self.subTest(data=data), np.errstate(over="raise", invalid="raise"):
                 self.assertEqual(compute_best_worst_at_k(data, len(data)), [(max(data), 0.0), (min(data), 0.0)])
 
     def test_invalid_input(self):
