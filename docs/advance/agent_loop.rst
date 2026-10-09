@@ -229,6 +229,37 @@ For example, in an owner that already implements these steps:
    await replica._server_handle.snapshot.remote()
    await owner.publish_replica(replica)
 
+Native verl weight synchronization
+"""""""""""""""""""""""""""""""""
+
+An existing ``CheckpointEngineManager`` can prepare a registered standalone replica
+for recovery without a Relay or a separate weight cache:
+
+.. code:: python
+
+   await owner.fence_replica(replica)
+   await checkpoint_manager.restart_replica(replica)
+   # Reuse the trainer's next normal synchronization at a safe GPU/optimizer boundary.
+   await checkpoint_manager.update_weights(global_steps)
+   await owner.publish_replica(replica, weight_version=global_steps)
+
+``restart_replica()`` rebuilds only that server, retains its workers/resource pool,
+and explicitly binds the existing weight receivers to the new actor handle.
+The replacement stays paused. The next versioned ``update_weights(global_steps)``
+uses the existing full-group topology, trainer export, transport and receiver loading.
+Rebuilt servers must pass their health checks before generation resumes. A failed
+load or health check leaves recovery pending; the caller keeps request routing fenced
+until synchronization succeeds and it publishes the new handles and HTTP addresses.
+
+This integration requires single-node standalone vLLM, full model weights or merged
+LoRA, a full-tensor synchronization backend, and no PD. Incremental-only/delta and
+colocated restart are unsupported; colocated synchronization keeps its existing
+offload/GPU handoff. Restart and weight synchronization cannot run concurrently;
+the lifecycle owner also serializes recovery with trainer GPU/optimizer phases.
+If no healthy rollout or queued training data can advance the trainer, invoke the
+existing weight synchronization at that safe boundary before waiting for another
+batch. Recovery does not require another optimizer update or add a transfer channel.
+
 SGLang
 ^^^^^^
 
