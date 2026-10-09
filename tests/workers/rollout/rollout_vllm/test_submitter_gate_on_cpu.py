@@ -505,6 +505,21 @@ def test_restart_retains_reservations_until_old_actor_is_confirmed_dead(monkeypa
     assert events == ["shutdown", "kill", "probe", "probe", "probe", "identity", "launch"]
 
 
+def test_restart_rejects_multiple_servers_before_mutation(monkeypatch):
+    events = []
+
+    async def untouched():
+        raise AssertionError("multiple servers must be rejected before any RPC")
+
+    replica, old = _make_restart_replica(monkeypatch, untouched, untouched, events)
+    servers = [old, object()]
+    replica.servers = servers
+    with pytest.raises(RuntimeError, match="exactly one initialized server actor"):
+        asyncio.run(replica.restart())
+    assert events == [] and replica.servers is servers
+    assert replica._server_handle is old and replica._server_address == "old-address"
+
+
 @pytest.mark.parametrize("actor_already_dead", [False, True])
 def test_restart_refuses_failed_shutdown_without_replacing_server(monkeypatch, actor_already_dead):
     events = []
