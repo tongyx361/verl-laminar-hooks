@@ -398,7 +398,7 @@ def test_restart_bounds_process_exit_wait_without_replacing_server(monkeypatch):
         await asyncio.Event().wait()
 
     replica.workers[0].__ray_call__.remote.side_effect = hung_probe
-    with pytest.raises(TimeoutError, match="process exit timed out"):
+    with pytest.raises(TimeoutError, match="cleanup timed out"):
         asyncio.run(replica.restart(timeout=0.03))
     kill.assert_called_once_with(server, no_restart=True)
     replica.launch_servers.assert_not_awaited()

@@ -20,6 +20,7 @@ import os
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -99,9 +100,6 @@ class _LegacyMPEngineCleanup:
     Related vLLM work addresses parent death and force-kill races:
     https://github.com/vllm-project/vllm/pull/55846
     https://github.com/vllm-project/vllm/pull/59984
-    Replace this fallback only after validating upstream shutdown's complete
-    process-exit contract, including failed cores; a version or PR alone is
-    not proof. Ray actor exit remains the replica owner's responsibility.
     """
 
     def __init__(self) -> None:
@@ -113,10 +111,8 @@ class _LegacyMPEngineCleanup:
         """Retain owned process identities before a failed core can orphan them."""
         excluded = self._initial_processes.copy()
         for process in self._initial_processes:
-            try:
+            with suppress(psutil.NoSuchProcess):
                 excluded.update(process.children(recursive=True))
-            except psutil.NoSuchProcess:
-                pass
         self._owned_processes.update(set(psutil.Process().children(recursive=True)) - excluded)
         return list(self._owned_processes)
 
@@ -135,11 +131,9 @@ class _LegacyMPEngineCleanup:
             if not alive:
                 break
             for process in alive:
-                try:
+                with suppress(psutil.NoSuchProcess):
                     # psutil checks the recorded creation time against PID reuse.
                     getattr(process, signal)()
-                except psutil.NoSuchProcess:
-                    pass
             _, alive = await asyncio.to_thread(psutil.wait_procs, alive, timeout=5)
         if alive:
             raise RuntimeError(
@@ -1593,29 +1587,14 @@ class vLLMReplica(RolloutReplica):
         if not self.workers:
             raise RuntimeError("engine restart requires retained rollout workers")
 
-        server = self.servers[0]
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
         if getattr(self, "_restart_in_progress", False):
             raise RuntimeError("vLLM server restart is already in progress")
         self._restart_in_progress = True
         try:
             try:
-                identity = await asyncio.wait_for(server.shutdown.remote(), timeout=timeout)
+                await asyncio.wait_for(self._stop_server_actor(self.servers[0]), timeout=timeout)
             except asyncio.TimeoutError as exc:
-                raise TimeoutError("vLLM server shutdown timed out; refusing to restart") from exc
-            if not isinstance(identity, tuple) or len(identity) != 2:
-                raise RuntimeError("vLLM shutdown returned an invalid process identity; refusing to restart")
-            pid, create_time = identity
-            if (
-                type(pid) is not int
-                or pid <= 0
-                or isinstance(create_time, bool)
-                or not isinstance(create_time, int | float)
-                or not 0 < create_time < float("inf")
-            ):
-                raise RuntimeError("vLLM shutdown returned an invalid process identity; refusing to restart")
-            await self._stop_server_actor(server, pid, create_time, deadline)
+                raise TimeoutError("vLLM server cleanup timed out; refusing to restart") from exc
 
             self.servers = []
             self._server_handle = None
@@ -1624,49 +1603,42 @@ class vLLMReplica(RolloutReplica):
         finally:
             self._restart_in_progress = False
 
-    async def _stop_server_actor(self, server: ActorHandle, pid: int, create_time: float, deadline: float) -> None:
-        """Kill the old actor and prove its Ray and OS exit within the shared deadline."""
-        # Older Ray releases only expose RayActorError, with terminal actor
-        # death semantics. Modern Ray also uses that base class for outages.
-        actor_died_error = getattr(ray.exceptions, "ActorDiedError", ray.exceptions.RayActorError)
-        actor_unavailable_error = getattr(ray.exceptions, "ActorUnavailableError", ())
+    async def _stop_server_actor(self, server: ActorHandle) -> None:
+        """Release the engine, kill the actor, and confirm its Ray and OS exit."""
+        identity = await server.shutdown.remote()
+        if not isinstance(identity, tuple) or len(identity) != 2:
+            raise RuntimeError("vLLM shutdown returned an invalid process identity; refusing to restart")
+        pid, create_time = identity
+        if (
+            type(pid) is not int
+            or pid <= 0
+            or isinstance(create_time, bool)
+            or not isinstance(create_time, int | float)
+            or not 0 < create_time < float("inf")
+        ):
+            raise RuntimeError("vLLM shutdown returned an invalid process identity; refusing to restart")
         ray.kill(server, no_restart=True)
-        loop = asyncio.get_running_loop()
         # ray.kill only forwards a request to GCS. A transient unavailable
         # actor is not proof that the old listener/process has exited.
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError("vLLM server actor exit timed out; refusing to restart")
             try:
-                await asyncio.wait_for(server.get_server_address.remote(), timeout=remaining)
-            except actor_died_error:
+                await server.get_server_address.remote()
+            except ray.exceptions.ActorDiedError:
                 break
-            except actor_unavailable_error:
+            except ray.exceptions.ActorUnavailableError:
                 pass
-            except asyncio.TimeoutError as exc:
-                raise TimeoutError("vLLM server actor exit timed out; refusing to restart") from exc
-            await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+            await asyncio.sleep(0.1)
 
         # GCS can publish DEAD before the asynchronous kill reaches the actor.
         # A reserved worker on this single node verifies OS exit, including the
         # old HTTP listener, without signaling a reused PID or dropping GPUs.
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError("vLLM server process exit timed out; refusing to restart")
-            try:
-                alive = await asyncio.wait_for(
-                    self.workers[0].__ray_call__.remote(_server_process_is_alive, pid, create_time),
-                    timeout=remaining,
-                )
-            except asyncio.TimeoutError as exc:
-                raise TimeoutError("vLLM server process exit timed out; refusing to restart") from exc
+            alive = await self.workers[0].__ray_call__.remote(_server_process_is_alive, pid, create_time)
             if not isinstance(alive, bool):
                 raise RuntimeError("vLLM server process probe returned an invalid result; refusing to restart")
             if not alive:
                 break
-            await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+            await asyncio.sleep(0.1)
 
     async def launch_servers(self):
         """Launch http server in each node."""
