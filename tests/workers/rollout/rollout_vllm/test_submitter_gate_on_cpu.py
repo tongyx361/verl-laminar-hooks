@@ -55,6 +55,7 @@ class _FakeEngine:
         self.reset_prefix_calls = 0
         self.outputs = []
         self.sampling_params = []
+        self.health_failure = None
 
     async def generate(self, prompt, sampling_params, request_id, lora_request=None, priority=0):
         self.sampling_params.append(sampling_params)
@@ -77,6 +78,10 @@ class _FakeEngine:
     async def reset_prefix_cache(self, reset_connector=True):
         self.reset_prefix_calls += 1
 
+    async def check_health(self):
+        if self.health_failure is not None:
+            raise self.health_failure
+
 
 def _make_server(node_rank: int = 0, cls=vllm_async_server.vLLMHttpServer):
     server = object.__new__(cls)
@@ -90,6 +95,8 @@ def _make_server(node_rank: int = 0, cls=vllm_async_server.vLLMHttpServer):
     server._resume_event.set()
     server._rejecting = False
     server._disaggregation_role = "null"
+    server._engine_processes_before = set()
+    server._engine_processes = set()
     return server
 
 
@@ -285,6 +292,472 @@ def test_snapshot_rejects_headless_node_without_touching_engine():
             await server.snapshot()
 
     asyncio.run(main())
+
+
+def test_snapshot_propagates_engine_failure_before_reading_stale_gauges():
+    server = _make_server()
+    failure = RuntimeError("engine core failed")
+    server.engine.health_failure = failure
+    # No logger is installed: a stale observation must never be read.
+    with pytest.raises(RuntimeError, match="engine core failed") as caught:
+        asyncio.run(server.snapshot())
+    assert caught.value is failure
+
+
+class _Process:
+    def __init__(self, name, events, children=()):
+        self.name = name
+        self.events = events
+        self.descendants = list(children)
+        self.pid = 1234
+
+    def create_time(self):
+        return 1.0
+
+    def children(self, recursive=True):
+        assert recursive
+        return self.descendants
+
+    def terminate(self):
+        self.events.append(("terminate", self.name))
+
+    def kill(self):
+        self.events.append(("kill", self.name))
+
+
+def test_healthy_snapshot_retains_engine_descendants_for_orphan_cleanup(monkeypatch):
+    events = []
+    engine_child = _Process("engine", events)
+    actor = _Process("actor", events, children=[engine_child])
+    monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda: actor)
+    server = _make_server()
+
+    def gauge(name, value):
+        sample = SimpleNamespace(name=name, value=value)
+        return SimpleNamespace(collect=lambda: [SimpleNamespace(samples=[sample])])
+
+    logger = object.__new__(vllm_async_server.PrometheusStatLogger)
+    logger.gauge_kv_cache_usage = {0: gauge("vllm:kv_cache_usage_perc", 0.25)}
+    logger.gauge_scheduler_waiting = {0: gauge("vllm:num_requests_waiting", 1)}
+    logger.gauge_scheduler_running = {0: gauge("vllm:num_requests_running", 2)}
+    server.engine.logger_manager = SimpleNamespace(prometheus_logger=logger)
+    assert asyncio.run(server.snapshot()) == {
+        "kv_cache_usage": 0.25,
+        "num_waiting_requests": 1,
+        "num_running_requests": 2,
+    }
+    # The core died and its worker was reparented before shutdown enumerated children.
+    actor.descendants = []
+    assert server._record_engine_processes() == [engine_child]
+
+
+def _make_shutdown_server():
+    server = _make_server()
+    server.rollout_mode = vllm_async_server.RolloutMode.STANDALONE
+    server.nnodes = 1
+    server.engine.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(distributed_executor_backend="mp"))
+    return server
+
+
+@pytest.mark.parametrize("remaining", [False, True])
+def test_shutdown_reaps_only_owned_processes_and_refuses_survivors(monkeypatch, remaining):
+    events = []
+    orphan = _Process("orphan", events)
+    unrelated_child = _Process("unrelated_child", events)
+    unrelated = _Process("unrelated", events, children=[unrelated_child])
+    actor = _Process("actor", events, children=[unrelated, unrelated_child])
+    monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda: actor)
+    server = _make_shutdown_server()
+    server._engine_processes_before = {unrelated}
+    server._engine_processes = {orphan}
+    server.engine.shutdown = lambda: events.append("shutdown")
+    waits = 0
+
+    def wait_procs(processes, timeout):
+        nonlocal waits
+        assert processes == [orphan], "a pre-existing child or its descendants must not be signaled"
+        assert timeout == 5
+        waits += 1
+        return ([], [orphan]) if waits < 3 or remaining else ([orphan], [])
+
+    monkeypatch.setattr(vllm_async_server.psutil, "wait_procs", wait_procs)
+    if remaining:
+        with pytest.raises(RuntimeError, match="owned engine processes alive"):
+            asyncio.run(server.shutdown())
+    else:
+        asyncio.run(server.shutdown())
+    assert events == ["shutdown", ("terminate", "orphan"), ("kill", "orphan")]
+    assert server._rejecting and server._submission_paused and server._resume_event.is_set()
+
+
+def test_shutdown_reaps_orphans_before_propagating_engine_shutdown_failure(monkeypatch):
+    events = []
+    orphan = _Process("orphan", events)
+    actor = _Process("actor", events)
+    monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda: actor)
+    server = _make_shutdown_server()
+    server._engine_processes = {orphan}
+    failure = RuntimeError("engine cleanup failed")
+
+    def shutdown():
+        events.append("shutdown")
+        raise failure
+
+    server.engine.shutdown = shutdown
+    waits = 0
+
+    def wait_procs(processes, timeout):
+        nonlocal waits
+        assert processes == [orphan]
+        waits += 1
+        return ([], [orphan]) if waits == 1 else ([orphan], [])
+
+    monkeypatch.setattr(vllm_async_server.psutil, "wait_procs", wait_procs)
+    with pytest.raises(RuntimeError, match="engine cleanup failed") as caught:
+        asyncio.run(server.shutdown())
+    assert caught.value is failure
+    assert events == ["shutdown", ("terminate", "orphan")]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rollout_mode", vllm_async_server.RolloutMode.COLOCATED),
+        ("nnodes", 2),
+        ("node_rank", 1),
+        ("_disaggregation_role", "prefill"),
+        ("executor", "ray"),
+    ],
+)
+def test_shutdown_rejects_unsupported_engine_before_closing_admission(field, value):
+    server = _make_shutdown_server()
+    if field == "executor":
+        server.engine.vllm_config.parallel_config.distributed_executor_backend = value
+    else:
+        setattr(server, field, value)
+    with pytest.raises(NotImplementedError):
+        asyncio.run(server.shutdown())
+    assert not server._submission_paused and not server._rejecting
+
+
+def _make_restart_replica(monkeypatch, shutdown, probe, events, worker_probe=None, process_identity=(1234, 1.0)):
+    async def shutdown_with_identity():
+        await shutdown()
+        return process_identity
+
+    old = SimpleNamespace(
+        shutdown=SimpleNamespace(remote=shutdown_with_identity),
+        get_server_address=SimpleNamespace(remote=probe),
+    )
+    replica = object.__new__(vllm_async_server.vLLMReplica)
+    replica.rollout_mode = vllm_async_server.RolloutMode.STANDALONE
+    replica.nnodes = 1
+    replica.config = SimpleNamespace(disaggregation=SimpleNamespace(enabled=False))
+    replica.servers = [old]
+    replica._server_handle = old
+    replica._server_address = "old-address"
+
+    async def probe_process(fn, pid, create_time):
+        events.append("identity")
+        if worker_probe is not None:
+            return await worker_probe(fn, pid, create_time)
+        return False
+
+    workers = [SimpleNamespace(__ray_call__=SimpleNamespace(remote=probe_process))]
+    resource_pool = object()
+    replica.workers, replica.resource_pool = workers, resource_pool
+
+    async def launch_servers():
+        assert replica.workers is workers and replica.resource_pool is resource_pool
+        assert replica.servers == [] and replica._server_handle is None and replica._server_address is None
+        events.append("launch")
+
+    def kill(actor, no_restart):
+        assert actor is old and no_restart is True
+        events.append("kill")
+
+    replica.launch_servers = launch_servers
+    monkeypatch.setattr(vllm_async_server.ray, "kill", kill)
+    return replica, old
+
+
+def test_restart_retains_reservations_until_old_actor_is_confirmed_dead(monkeypatch):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        events.append("probe")
+        count = events.count("probe")
+        if count == 2:
+            raise vllm_async_server.ray.exceptions.ActorUnavailableError("temporarily unreachable", None)
+        if count == 3:
+            raise vllm_async_server.ray.exceptions.ActorDiedError()
+        return "old-address"
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+    asyncio.run(replica.restart())
+    assert events == ["shutdown", "kill", "probe", "probe", "probe", "identity", "launch"]
+
+
+@pytest.mark.parametrize("actor_already_dead", [False, True])
+def test_restart_refuses_failed_shutdown_without_replacing_server(monkeypatch, actor_already_dead):
+    events = []
+    failure = vllm_async_server.ray.exceptions.ActorDiedError() if actor_already_dead else RuntimeError("not released")
+
+    async def shutdown():
+        events.append("shutdown")
+        raise failure
+
+    async def probe():
+        raise AssertionError("failed shutdown must not kill or probe the actor")
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+    with pytest.raises(type(failure)) as caught:
+        asyncio.run(replica.restart())
+    assert caught.value is failure
+    assert events == ["shutdown"]
+    assert replica.servers == [old] and replica._server_handle is old
+
+
+@pytest.mark.parametrize("identity", [None, (True, 1.0), (1234, float("nan"))])
+def test_restart_refuses_invalid_process_identity_before_killing_actor(monkeypatch, identity):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        raise AssertionError("invalid identity must not kill or probe the actor")
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events, process_identity=identity)
+    with pytest.raises(RuntimeError, match="invalid process identity"):
+        asyncio.run(replica.restart())
+    assert events == ["shutdown"]
+    assert replica.servers == [old] and replica._server_handle is old
+
+
+@pytest.mark.parametrize("behavior", ["alive", "unavailable", "hung"])
+def test_restart_bounds_actor_exit_confirmation_and_refuses_replacement(monkeypatch, behavior):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        events.append("probe")
+        if behavior == "unavailable":
+            raise vllm_async_server.ray.exceptions.ActorUnavailableError("temporarily unreachable", None)
+        if behavior == "hung":
+            await asyncio.Event().wait()
+        return "old-address"
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+    with pytest.raises(TimeoutError, match="actor exit timed out"):
+        asyncio.run(replica.restart(timeout=0.03))
+    assert "launch" not in events
+    assert replica.servers == [old] and replica._server_handle is old
+
+
+def test_restart_bounds_shutdown_rpc_before_killing_actor(monkeypatch):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+        await asyncio.Event().wait()
+
+    async def probe():
+        raise AssertionError("timed-out shutdown must not probe the actor")
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+    with pytest.raises(TimeoutError, match="shutdown timed out"):
+        asyncio.run(replica.restart(timeout=0.03))
+    assert events == ["shutdown"]
+    assert replica.servers == [old]
+
+
+def test_restart_refuses_overlapping_calls_and_releases_guard_after_cancellation(monkeypatch):
+    events = []
+
+    async def main():
+        shutting_down = asyncio.Event()
+
+        async def shutdown():
+            events.append("shutdown")
+            shutting_down.set()
+            await asyncio.Event().wait()
+
+        async def probe():
+            raise AssertionError("unfinished shutdown must not probe the actor")
+
+        replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+        first = asyncio.create_task(replica.restart())
+        await shutting_down.wait()
+        with pytest.raises(RuntimeError, match="already in progress"):
+            await replica.restart()
+        assert events == ["shutdown"] and replica.servers == [old]
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not replica._restart_in_progress
+        with pytest.raises(TimeoutError, match="shutdown timed out"):
+            await replica.restart(timeout=0.03)
+        assert events == ["shutdown", "shutdown"] and replica.servers == [old]
+        assert not replica._restart_in_progress
+
+    asyncio.run(main())
+
+
+def test_restart_cancellation_does_not_replace_server(monkeypatch):
+    events = []
+
+    async def main():
+        probing = asyncio.Event()
+
+        async def shutdown():
+            events.append("shutdown")
+
+        async def probe():
+            probing.set()
+            await asyncio.Event().wait()
+
+        replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+        task = asyncio.create_task(replica.restart())
+        await probing.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert replica.servers == [old] and replica._server_handle is old
+        assert events == ["shutdown", "kill"]
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_restart_rejects_invalid_deadline_before_mutation(monkeypatch, timeout):
+    events = []
+
+    async def untouched():
+        raise AssertionError("invalid timeout must not reach the actor")
+
+    replica, old = _make_restart_replica(monkeypatch, untouched, untouched, events)
+    with pytest.raises(ValueError, match="positive and finite"):
+        asyncio.run(replica.restart(timeout=timeout))
+    assert events == [] and replica.servers == [old]
+
+
+def test_restart_does_not_treat_generic_actor_error_as_proof_of_death(monkeypatch):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        raise vllm_async_server.ray.exceptions.RayActorError()
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+    with pytest.raises(vllm_async_server.ray.exceptions.RayActorError):
+        asyncio.run(replica.restart())
+    assert events == ["shutdown", "kill"] and replica.servers == [old]
+
+
+def test_restart_supports_legacy_ray_terminal_actor_error(monkeypatch):
+    events = []
+    legacy_actor_error = vllm_async_server.ray.exceptions.RayActorError
+    monkeypatch.delattr(vllm_async_server.ray.exceptions, "ActorDiedError")
+    monkeypatch.delattr(vllm_async_server.ray.exceptions, "ActorUnavailableError")
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        events.append("probe")
+        raise legacy_actor_error()
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events)
+    asyncio.run(replica.restart())
+    assert events == ["shutdown", "kill", "probe", "identity", "launch"]
+
+
+def test_restart_waits_for_os_process_exit_after_ray_reports_actor_dead(monkeypatch):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        events.append("probe")
+        raise vllm_async_server.ray.exceptions.ActorDiedError()
+
+    async def worker_probe(fn, pid, create_time):
+        assert (pid, create_time) == (1234, 1.0)
+        return events.count("identity") == 1
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events, worker_probe)
+    asyncio.run(replica.restart())
+    assert events == ["shutdown", "kill", "probe", "identity", "identity", "launch"]
+
+
+@pytest.mark.parametrize("behavior", ["alive", "hung", "access_error", "invalid_result"])
+def test_restart_fails_closed_when_old_process_exit_cannot_be_proved(monkeypatch, behavior):
+    events = []
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        raise vllm_async_server.ray.exceptions.ActorDiedError()
+
+    async def worker_probe(fn, pid, create_time):
+        if behavior == "access_error":
+            raise vllm_async_server.psutil.AccessDenied(pid)
+        if behavior == "hung":
+            await asyncio.Event().wait()
+        if behavior == "invalid_result":
+            return None
+        return True
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events, worker_probe)
+    error = {
+        "access_error": vllm_async_server.psutil.AccessDenied,
+        "invalid_result": RuntimeError,
+    }.get(behavior, TimeoutError)
+    with pytest.raises(error):
+        asyncio.run(replica.restart(timeout=0.03))
+    assert "launch" not in events
+    assert replica.servers == [old] and replica._server_handle is old
+
+
+def test_restart_treats_reused_pid_as_old_actor_gone_without_signaling_it(monkeypatch):
+    events = []
+    replacement = SimpleNamespace(create_time=lambda: 2.0, is_running=lambda: True)
+    monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda pid: replacement)
+
+    async def shutdown():
+        events.append("shutdown")
+
+    async def probe():
+        raise vllm_async_server.ray.exceptions.ActorDiedError()
+
+    async def worker_probe(fn, pid, create_time):
+        return fn(None, pid, create_time)
+
+    replica, old = _make_restart_replica(monkeypatch, shutdown, probe, events, worker_probe)
+    asyncio.run(replica.restart())
+    assert events == ["shutdown", "kill", "identity", "launch"]
+
+
+def test_process_identity_probe_reports_live_and_gone_actor(monkeypatch):
+    process = SimpleNamespace(create_time=lambda: 1.0, is_running=lambda: True)
+    monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda pid: process)
+    assert vllm_async_server._server_process_is_alive(None, 1234, 1.0)
+
+    def gone(pid):
+        raise vllm_async_server.psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(vllm_async_server.psutil, "Process", gone)
+    assert not vllm_async_server._server_process_is_alive(None, 1234, 1.0)
 
 
 class _SelectedTokenServer(vllm_async_server.vLLMHttpServer):

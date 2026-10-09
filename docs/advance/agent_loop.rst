@@ -1,7 +1,7 @@
 Agent Loop
 ==========
 
-Last updated: 07/17/2025.
+Last updated: 10/09/2026.
 
 .. versionadded:: 0.4.2
    [status: alpha]
@@ -188,6 +188,36 @@ vLLM
 
 For vLLM, the Async LLM Engine is running in same process as the server, and ModelRunner is running in same process as FSDP/Megatron-LM workers.
 Async LLM Engine communicate with ModelRunner through ZeroMQ. When server receive a request, it directly call engine to generate response_ids.
+
+Explicit replica recovery
+"""""""""""""""""""""""""
+
+``vLLMHttpServer.snapshot()`` checks the engine's health before returning scheduler metrics.
+An engine failure propagates to the caller, so retained metrics from a dead engine cannot be mistaken for a healthy idle server.
+
+An external lifecycle owner can call ``await replica.restart()`` on a ``vLLMReplica``
+using single-node ``STANDALONE`` mode, the ``mp`` executor, and no prefill/decode disaggregation.
+Restart closes admission, shuts down the old engine and verifies that its owned subprocesses have exited.
+It then kills the old server actor and confirms its Ray terminal state.
+A retained worker on the same node checks the actor's PID and creation time to verify
+that the old process, including its HTTP listener, exited before launching a replacement.
+Cleanup failure or an actor-exit timeout prevents replacement startup.
+``restart(timeout=60.0)`` bounds the old engine's cleanup RPC and actor-exit wait;
+replacement launch uses the existing startup behavior.
+The existing worker and resource-pool reservations are retained.
+
+The caller must fence traffic before restarting, reload the intended weights into the new engine,
+replace cached actor handles and HTTP addresses, and check health before reopening traffic.
+Restart does not restore requests, KV cache, weights, or application queues, and does not retry failed generations.
+For example, in an owner that already implements these steps:
+
+.. code:: python
+
+   await owner.fence_replica(replica)
+   await replica.restart()
+   await owner.reload_weights(replica)
+   await replica._server_handle.snapshot.remote()
+   await owner.publish_replica(replica)
 
 SGLang
 ^^^^^^

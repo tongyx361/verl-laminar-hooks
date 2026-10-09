@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from pprint import pprint
 from typing import Any, Callable, Optional
 
+import psutil
 import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
@@ -77,6 +78,16 @@ _VLLM_VERSION = version.parse(vllm.__version__)
 
 # Max wait for admissions already past the submission gate to reach the engine.
 _GATE_BARRIER_TIMEOUT_S = 60.0
+
+
+def _server_process_is_alive(_worker, pid: int, create_time: float) -> bool:
+    """Check an old server's exact process identity on its retained worker node."""
+    try:
+        process = psutil.Process(pid)
+        return process.create_time() == create_time and process.is_running()
+    except psutil.NoSuchProcess:
+        return False
+
 
 if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
@@ -493,6 +504,10 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        # Record identities before creating the engine so recovery never reaps
+        # pre-existing children of this actor (or their later descendants).
+        self._engine_processes_before = set(psutil.Process().children(recursive=True))
+        self._engine_processes: set[psutil.Process] = set()
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
@@ -532,7 +547,64 @@ class vLLMHttpServer:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
+        self._record_engine_processes()
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+
+    def _record_engine_processes(self) -> list[psutil.Process]:
+        """Retain owned process identities before a failed core can orphan them."""
+        excluded = self._engine_processes_before.copy()
+        for process in self._engine_processes_before:
+            try:
+                excluded.update(process.children(recursive=True))
+            except psutil.NoSuchProcess:
+                pass
+        self._engine_processes.update(set(psutil.Process().children(recursive=True)) - excluded)
+        return list(self._engine_processes)
+
+    async def shutdown(self) -> tuple[int, float]:
+        """Release a single-node standalone MP engine; the owner then kills this actor.
+
+        The HTTP listener stays owned by the actor. Return its exact process
+        identity after the recorded engine descendants have exited, so the
+        owner can confirm actor process exit on the same node after ray.kill.
+        """
+        if self.rollout_mode != RolloutMode.STANDALONE or self.nnodes != 1 or self.node_rank != 0:
+            raise NotImplementedError("engine shutdown requires a single-node standalone replica")
+        if self._disaggregation_role != "null":
+            raise NotImplementedError("engine shutdown does not support PD")
+        if self.engine.vllm_config.parallel_config.distributed_executor_backend != "mp":
+            raise NotImplementedError("engine shutdown requires the multiprocessing executor")
+
+        self._rejecting = True
+        self._submission_paused = True
+        self._resume_event.set()
+        children = self._record_engine_processes()
+        shutdown_error = None
+        try:
+            await asyncio.to_thread(self.engine.shutdown)
+        except Exception as exc:
+            # A broken core may prevent normal cleanup. Reap our recorded
+            # descendants before propagating the original shutdown failure.
+            shutdown_error = exc
+        _, alive = await asyncio.to_thread(psutil.wait_procs, children, timeout=5)
+        for signal in ("terminate", "kill"):
+            if not alive:
+                break
+            for process in alive:
+                try:
+                    # psutil checks the recorded creation time against PID reuse.
+                    getattr(process, signal)()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = await asyncio.to_thread(psutil.wait_procs, alive, timeout=5)
+        if alive:
+            raise RuntimeError(
+                "vLLM shutdown left owned engine processes alive; refusing to restart"
+            ) from shutdown_error
+        if shutdown_error is not None:
+            raise shutdown_error
+        actor = psutil.Process()
+        return actor.pid, actor.create_time()
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -939,6 +1011,8 @@ class vLLMHttpServer:
                 "vLLMHttpServer.snapshot() requires the node-rank-0 AsyncLLM; "
                 f"node_rank={self.node_rank} actors run headless and have no engine."
             )
+        await self.engine.check_health()
+        self._record_engine_processes()
         prometheus_logger = self._prometheus_logger
         kv_cache_usage = self._prometheus_values(
             prometheus_logger.gauge_kv_cache_usage,
@@ -1477,6 +1551,102 @@ class vLLMReplica(RolloutReplica):
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
         self.server_class = ray.remote(vLLMHttpServer)
+
+    async def restart(self, timeout: float = 60.0) -> None:
+        """Replace standalone engine servers after proving their release.
+
+        Keep the existing workers and resource pool. The caller owns routing
+        and weight restoration. ``timeout`` bounds old-server shutdown and
+        actor-exit confirmation, not replacement engine initialization.
+        """
+        if self.rollout_mode != RolloutMode.STANDALONE or self.nnodes != 1:
+            raise NotImplementedError("engine restart requires a single-node standalone replica")
+        if self.config.disaggregation.enabled:
+            raise NotImplementedError("engine restart does not support PD")
+        if not 0 < timeout < float("inf"):
+            raise ValueError("engine restart timeout must be positive and finite")
+        if not self.servers:
+            raise RuntimeError("engine restart requires initialized server actors")
+        if not self.workers:
+            raise RuntimeError("engine restart requires retained rollout workers")
+
+        # Older Ray releases only expose RayActorError, with terminal actor
+        # death semantics. Modern Ray also uses that base class for outages.
+        actor_died_error = getattr(ray.exceptions, "ActorDiedError", ray.exceptions.RayActorError)
+        actor_unavailable_error = getattr(ray.exceptions, "ActorUnavailableError", ())
+        old_servers = tuple(self.servers)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        if getattr(self, "_restart_in_progress", False):
+            raise RuntimeError("vLLM server restart is already in progress")
+        self._restart_in_progress = True
+        try:
+            try:
+                old_processes = await asyncio.wait_for(
+                    asyncio.gather(*(server.shutdown.remote() for server in old_servers)), timeout=timeout
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError("vLLM server shutdown timed out; refusing to restart") from exc
+            if len(old_processes) != len(old_servers):
+                raise RuntimeError("vLLM shutdown returned incomplete process identities; refusing to restart")
+            for identity in old_processes:
+                if not isinstance(identity, tuple) or len(identity) != 2:
+                    raise RuntimeError("vLLM shutdown returned an invalid process identity; refusing to restart")
+                pid, create_time = identity
+                if (
+                    type(pid) is not int
+                    or pid <= 0
+                    or isinstance(create_time, bool)
+                    or not isinstance(create_time, int | float)
+                    or not 0 < create_time < float("inf")
+                ):
+                    raise RuntimeError("vLLM shutdown returned an invalid process identity; refusing to restart")
+            for server in old_servers:
+                ray.kill(server, no_restart=True)
+            for server in old_servers:
+                # ray.kill only forwards a request to GCS. A transient unavailable
+                # actor is not proof that the old listener/process has exited.
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError("vLLM server actor exit timed out; refusing to restart")
+                    try:
+                        await asyncio.wait_for(server.get_server_address.remote(), timeout=remaining)
+                    except actor_died_error:
+                        break
+                    except actor_unavailable_error:
+                        pass
+                    except asyncio.TimeoutError as exc:
+                        raise TimeoutError("vLLM server actor exit timed out; refusing to restart") from exc
+                    await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+
+            # GCS can publish DEAD before the asynchronous kill reaches the actor.
+            # A reserved worker on this single node verifies OS exit, including the
+            # old HTTP listener, without signaling a reused PID or dropping GPUs.
+            for pid, create_time in old_processes:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError("vLLM server process exit timed out; refusing to restart")
+                    try:
+                        alive = await asyncio.wait_for(
+                            self.workers[0].__ray_call__.remote(_server_process_is_alive, pid, create_time),
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise TimeoutError("vLLM server process exit timed out; refusing to restart") from exc
+                    if not isinstance(alive, bool):
+                        raise RuntimeError("vLLM server process probe returned an invalid result; refusing to restart")
+                    if not alive:
+                        break
+                    await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+
+            self.servers = []
+            self._server_handle = None
+            self._server_address = None
+            await self.launch_servers()
+        finally:
+            self._restart_in_progress = False
 
     async def launch_servers(self):
         """Launch http server in each node."""
