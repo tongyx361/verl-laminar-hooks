@@ -206,6 +206,16 @@ Cleanup failure or an actor-exit timeout prevents replacement startup.
 replacement launch uses the existing startup behavior.
 The existing worker and resource-pool reservations are retained.
 
+Engine-process cleanup is isolated behind a compatibility helper that calls vLLM's native
+shutdown, retains owned process identities and confirms their exit before replacement.
+Related upstream work includes `vLLM #55846 <https://github.com/vllm-project/vllm/pull/55846>`_
+for parent-death cleanup and `vLLM #59984 <https://github.com/vllm-project/vllm/pull/59984>`_
+for process-tree cleanup races. These changes address parts of the cleanup lifecycle;
+removing the fallback requires validating that the selected vLLM implementation confirms
+all owned engine processes have exited, including after an EngineCore failure.
+The helper can then delegate entirely to native shutdown without changing the replica
+restart flow. Server-actor and HTTP-listener exit confirmation remain owned by verl.
+
 The caller must fence traffic before restarting, reload the intended weights into the new engine,
 replace cached actor handles and HTTP addresses, and check health before reopening traffic.
 Restart does not restore requests, KV cache, weights, or application queues, and does not retry failed generations.

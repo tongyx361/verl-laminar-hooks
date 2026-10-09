@@ -89,6 +89,62 @@ def _server_process_is_alive(_worker, pid: int, create_time: float) -> bool:
         return False
 
 
+class _LegacyMPEngineCleanup:
+    """Keep MP engine ownership and fallback cleanup behind one replacement point.
+
+    Related vLLM work addresses parent death and force-kill races:
+    https://github.com/vllm-project/vllm/pull/55846
+    https://github.com/vllm-project/vllm/pull/59984
+    Replace this fallback only after validating upstream shutdown's complete
+    process-exit contract, including failed cores; a version or PR alone is
+    not proof. Ray actor exit remains the replica owner's responsibility.
+    """
+
+    def __init__(self) -> None:
+        # Exclude pre-existing actor children and their later descendants.
+        self._initial_processes = set(psutil.Process().children(recursive=True))
+        self._owned_processes: set[psutil.Process] = set()
+
+    def record(self) -> list[psutil.Process]:
+        """Retain owned process identities before a failed core can orphan them."""
+        excluded = self._initial_processes.copy()
+        for process in self._initial_processes:
+            try:
+                excluded.update(process.children(recursive=True))
+            except psutil.NoSuchProcess:
+                pass
+        self._owned_processes.update(set(psutil.Process().children(recursive=True)) - excluded)
+        return list(self._owned_processes)
+
+    async def shutdown(self, engine: AsyncLLM) -> None:
+        """Run vLLM shutdown, reap recorded descendants, and fail closed on errors."""
+        children = self.record()
+        shutdown_error = None
+        try:
+            await asyncio.to_thread(engine.shutdown)
+        except Exception as exc:
+            # A broken core may prevent normal cleanup. Reap our recorded
+            # descendants before propagating the original shutdown failure.
+            shutdown_error = exc
+        _, alive = await asyncio.to_thread(psutil.wait_procs, children, timeout=5)
+        for signal in ("terminate", "kill"):
+            if not alive:
+                break
+            for process in alive:
+                try:
+                    # psutil checks the recorded creation time against PID reuse.
+                    getattr(process, signal)()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = await asyncio.to_thread(psutil.wait_procs, alive, timeout=5)
+        if alive:
+            raise RuntimeError(
+                "vLLM shutdown left owned engine processes alive; refusing to restart"
+            ) from shutdown_error
+        if shutdown_error is not None:
+            raise shutdown_error
+
+
 if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
 
@@ -504,10 +560,8 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        # Record identities before creating the engine so recovery never reaps
-        # pre-existing children of this actor (or their later descendants).
-        self._engine_processes_before = set(psutil.Process().children(recursive=True))
-        self._engine_processes: set[psutil.Process] = set()
+        # Capture exclusions before creating the engine's subprocesses.
+        self._engine_cleanup = _LegacyMPEngineCleanup()
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
@@ -547,19 +601,8 @@ class vLLMHttpServer:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
-        self._record_engine_processes()
+        self._engine_cleanup.record()
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
-
-    def _record_engine_processes(self) -> list[psutil.Process]:
-        """Retain owned process identities before a failed core can orphan them."""
-        excluded = self._engine_processes_before.copy()
-        for process in self._engine_processes_before:
-            try:
-                excluded.update(process.children(recursive=True))
-            except psutil.NoSuchProcess:
-                pass
-        self._engine_processes.update(set(psutil.Process().children(recursive=True)) - excluded)
-        return list(self._engine_processes)
 
     async def shutdown(self) -> tuple[int, float]:
         """Release a single-node standalone MP engine; the owner then kills this actor.
@@ -578,31 +621,7 @@ class vLLMHttpServer:
         self._rejecting = True
         self._submission_paused = True
         self._resume_event.set()
-        children = self._record_engine_processes()
-        shutdown_error = None
-        try:
-            await asyncio.to_thread(self.engine.shutdown)
-        except Exception as exc:
-            # A broken core may prevent normal cleanup. Reap our recorded
-            # descendants before propagating the original shutdown failure.
-            shutdown_error = exc
-        _, alive = await asyncio.to_thread(psutil.wait_procs, children, timeout=5)
-        for signal in ("terminate", "kill"):
-            if not alive:
-                break
-            for process in alive:
-                try:
-                    # psutil checks the recorded creation time against PID reuse.
-                    getattr(process, signal)()
-                except psutil.NoSuchProcess:
-                    pass
-            _, alive = await asyncio.to_thread(psutil.wait_procs, alive, timeout=5)
-        if alive:
-            raise RuntimeError(
-                "vLLM shutdown left owned engine processes alive; refusing to restart"
-            ) from shutdown_error
-        if shutdown_error is not None:
-            raise shutdown_error
+        await self._engine_cleanup.shutdown(self.engine)
         actor = psutil.Process()
         return actor.pid, actor.create_time()
 
@@ -1012,7 +1031,7 @@ class vLLMHttpServer:
                 f"node_rank={self.node_rank} actors run headless and have no engine."
             )
         await self.engine.check_health()
-        self._record_engine_processes()
+        self._engine_cleanup.record()
         prometheus_logger = self._prometheus_logger
         kv_cache_usage = self._prometheus_values(
             prometheus_logger.gauge_kv_cache_usage,

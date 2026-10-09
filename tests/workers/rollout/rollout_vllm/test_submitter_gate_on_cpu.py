@@ -95,8 +95,7 @@ def _make_server(node_rank: int = 0, cls=vllm_async_server.vLLMHttpServer):
     server._resume_event.set()
     server._rejecting = False
     server._disaggregation_role = "null"
-    server._engine_processes_before = set()
-    server._engine_processes = set()
+    server._engine_cleanup = vllm_async_server._LegacyMPEngineCleanup()
     return server
 
 
@@ -328,9 +327,10 @@ class _Process:
 def test_healthy_snapshot_retains_engine_descendants_for_orphan_cleanup(monkeypatch):
     events = []
     engine_child = _Process("engine", events)
-    actor = _Process("actor", events, children=[engine_child])
+    actor = _Process("actor", events)
     monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda: actor)
     server = _make_server()
+    actor.descendants = [engine_child]
 
     def gauge(name, value):
         sample = SimpleNamespace(name=name, value=value)
@@ -348,7 +348,7 @@ def test_healthy_snapshot_retains_engine_descendants_for_orphan_cleanup(monkeypa
     }
     # The core died and its worker was reparented before shutdown enumerated children.
     actor.descendants = []
-    assert server._record_engine_processes() == [engine_child]
+    assert server._engine_cleanup.record() == [engine_child]
 
 
 def _make_shutdown_server():
@@ -364,12 +364,14 @@ def test_shutdown_reaps_only_owned_processes_and_refuses_survivors(monkeypatch, 
     events = []
     orphan = _Process("orphan", events)
     unrelated_child = _Process("unrelated_child", events)
-    unrelated = _Process("unrelated", events, children=[unrelated_child])
-    actor = _Process("actor", events, children=[unrelated, unrelated_child])
+    unrelated = _Process("unrelated", events)
+    actor = _Process("actor", events, children=[unrelated])
     monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda: actor)
     server = _make_shutdown_server()
-    server._engine_processes_before = {unrelated}
-    server._engine_processes = {orphan}
+    unrelated.descendants = [unrelated_child]
+    actor.descendants = [unrelated, unrelated_child, orphan]
+    server._engine_cleanup.record()
+    actor.descendants = [unrelated, unrelated_child]
     server.engine.shutdown = lambda: events.append("shutdown")
     waits = 0
 
@@ -396,7 +398,9 @@ def test_shutdown_reaps_orphans_before_propagating_engine_shutdown_failure(monke
     actor = _Process("actor", events)
     monkeypatch.setattr(vllm_async_server.psutil, "Process", lambda: actor)
     server = _make_shutdown_server()
-    server._engine_processes = {orphan}
+    actor.descendants = [orphan]
+    server._engine_cleanup.record()
+    actor.descendants = []
     failure = RuntimeError("engine cleanup failed")
 
     def shutdown():
