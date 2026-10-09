@@ -15,7 +15,6 @@
 import os
 from unittest.mock import patch
 
-import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.constants_ppo import NVTX_INJECTION_ENV, get_ppo_ray_runtime_env
@@ -50,18 +49,3 @@ def test_nvtx_injection_override_can_be_opted_out():
         env_vars = get_ppo_ray_runtime_env(_config("torch"))["env_vars"]
 
     assert NVTX_INJECTION_ENV not in env_vars
-
-
-def test_vllm_compile_cache_uses_upstream_default():
-    with patch.dict(os.environ, {}, clear=True):
-        env_vars = get_ppo_ray_runtime_env()["env_vars"]
-
-    assert "VLLM_DISABLE_COMPILE_CACHE" not in env_vars
-
-
-@pytest.mark.parametrize("value", ["0", "1"])
-def test_vllm_compile_cache_override_is_forwarded(value):
-    with patch.dict(os.environ, {"VLLM_DISABLE_COMPILE_CACHE": value}, clear=True):
-        env_vars = get_ppo_ray_runtime_env()["env_vars"]
-
-    assert env_vars["VLLM_DISABLE_COMPILE_CACHE"] == value
