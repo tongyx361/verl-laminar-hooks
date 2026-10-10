@@ -28,6 +28,7 @@ _preprocess_sampling_params before admission, _postprocess_output after release.
 """
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -505,6 +506,37 @@ def test_output_hook_runs_for_requests_aborted_with_empty_outputs(monkeypatch):
 
         assert output.stop_reason == "aborted" and output.token_ids == []
         assert output.extra_fields["selected_logprobs"] == []
+        assert server._admitting == 0
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    "tokens,recover,routing", [([5, 9], True, False), ([], True, False), ([5, 9], False, False), ([5, 9], True, True)]
+)
+def test_engine_failure_preserves_available_progress_only_when_requested(monkeypatch, tokens, recover, routing):
+    async def main():
+        server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [])
+        server.config = replace(server.config, enable_rollout_routing_replay=routing)
+        rows = [{token: Logprob(logprob=-0.1, rank=1)} for token in tokens]
+
+        async def fail(**kwargs):
+            if tokens:
+                yield _request_output(tokens, rows)
+            raise EngineDeadError()
+
+        server.engine.generate = fail
+        if not recover:
+            with pytest.raises(EngineDeadError):
+                await server.generate([1, 2, 3], {"logprobs": True}, "r")
+        else:
+            output = await server.generate([1, 2, 3], {"logprobs": True}, "r", recover_engine_failure=True)
+            assert output.token_ids == ([] if routing else tokens) and output.stop_reason == "aborted"
+            assert output.log_probs == ([-0.1] * len(tokens) if tokens and not routing else None)
+            assert output.extra_fields["engine_failed"] and output.extra_fields["global_steps"] == 7
+            assert server._submission_paused and server._rejecting
+            late = await server.generate([1, 2, 3], {}, "late", recover_engine_failure=True)
+            assert late.token_ids == [] and late.extra_fields["engine_failed"]
         assert server._admitting == 0
 
     asyncio.run(main())

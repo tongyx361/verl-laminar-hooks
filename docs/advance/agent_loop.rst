@@ -263,9 +263,43 @@ batch. Recovery does not require another optimizer update or add a transfer chan
 
 See ``examples/fault_tolerance/restart_vllm_replica.py`` and its README for a
 self-contained three-GPU example that creates a tiny model, injects an owned
-EngineCore failure, and recovers through these APIs. Its sequential requests
-make the traffic fence explicit at the application boundary, and its final
-cleanup releases only the actors and placement group it created.
+EngineCore failure during generation, and recovers through these APIs. It fences
+the load balancer, restores the current committed weights and republishes the
+replacement before pending requests finish. Final cleanup releases only its own
+actors and placement group.
+
+Request replay
+""""""""""""""
+
+Applications owning replica recovery can opt their native client into bounded
+engine-failure replay:
+
+.. code:: python
+
+   client = server_manager.get_client(engine_recovery_timeout=300, max_engine_retries=3)
+   # For existing partial-rollout continuation, use FullyAsyncLLMServerClient.
+
+The client fences only the failed actor handle, then reacquires a healthy or
+republished server. ``LLMServerClient`` replays the current generation from its
+original prompt and token budget; its owner must restore the same committed
+weight version. ``FullyAsyncLLMServerClient`` retains partial progress when
+partial rollout is enabled, including token logprobs, routing records and weight
+version ranges, and subtracts generated tokens from the remaining budget.
+
+When the EngineCore fails but its server actor survives, the server returns its
+latest cumulative output marked ``engine_failed``. If the actor itself dies,
+only segments already returned to the client survive. Continuation prefills
+the saved token prefix to rebuild KV; it does not preserve the old engine's KV
+or sampling RNG. If required logprobs or MoE routing records are unavailable,
+that attempt is replayed without its prefix. Validation errors and cancellation
+are not replayed.
+
+The client does not restart replicas or schedule trainer synchronization.
+The lifecycle owner must restore weights and publish the new handle/address;
+waiting for the next optimizer update while the trainer is waiting for this
+rollout would deadlock. Reuse ``update_weights(current_version)`` at a safe
+boundary instead. Replay is opt-in, and waiting after a fault is bounded by the
+configured timeout and per-generation failure budget.
 
 SGLang
 ^^^^^^

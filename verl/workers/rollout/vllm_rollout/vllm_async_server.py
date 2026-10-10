@@ -41,6 +41,7 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 
 from verl.plugin.platform import get_platform
@@ -659,6 +660,7 @@ class vLLMHttpServer:
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
         session_id: Optional[str] = None,
+        recover_engine_failure: bool = False,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
@@ -770,7 +772,11 @@ class vLLMHttpServer:
 
         rejected = await self._park_until_admitted(request_id)
         if rejected is not None:
+            if recover_engine_failure and getattr(self, "_engine_failed", False):
+                rejected.extra_fields["engine_failed"] = True
             return rejected
+        generation_version = self.global_steps
+        engine_failed = False
 
         with RLInsightLogger.trace_state(
             "vllm_generate",
@@ -794,12 +800,41 @@ class vLLMHttpServer:
                         admitted = True
                         self._admitting -= 1
                     final_res = output
+            except EngineDeadError:
+                if not recover_engine_failure:
+                    raise
+                # The server actor survives an EngineCore failure. Its last cumulative
+                # output can rebuild the prefix on a replacement engine; no KV is reused.
+                engine_failed = True
+                self._engine_failed = True
+                self._submission_paused = True
+                self._rejecting = True
+                self._resume_event.clear()
             finally:
                 if not admitted:
                     self._admitting -= 1
-            assert final_res is not None
+            if final_res is None:
+                if not engine_failed:
+                    raise RuntimeError("generation ended without an output")
+                return TokenOutput(
+                    token_ids=[],
+                    stop_reason="aborted",
+                    extra_fields={"global_steps": generation_version, "engine_failed": True},
+                )
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": generation_version}
+        if engine_failed:
+            extra_fields["engine_failed"] = True
+            if final_res.outputs:
+                completion = final_res.outputs[0]
+                missing_logprobs = sampling_params.logprobs is not None and (
+                    completion.logprobs is None or len(completion.logprobs) != len(completion.token_ids)
+                )
+                # vLLM may publish MoE routing only when a request finishes. Recompute
+                # this attempt rather than retaining tokens without their original routes.
+                missing_routing = self.config.enable_rollout_routing_replay and completion.routed_experts is None
+                if missing_logprobs or missing_routing:
+                    return TokenOutput(token_ids=[], stop_reason="aborted", extra_fields=extra_fields)
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -837,7 +872,7 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
+        if engine_failed or finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
             stop_reason = "completed"
