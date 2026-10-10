@@ -57,9 +57,13 @@ class _FakeEngine:
         self.reset_prefix_calls = 0
         self.outputs = []
         self.sampling_params = []
+        self.data_parallel_ranks = []
 
-    async def generate(self, prompt, sampling_params, request_id, lora_request=None, priority=0):
+    async def generate(
+        self, prompt, sampling_params, request_id, lora_request=None, priority=0, data_parallel_rank=None
+    ):
         self.sampling_params.append(sampling_params)
+        self.data_parallel_ranks.append(data_parallel_rank)
         for output in self.outputs:
             yield output
 
@@ -423,9 +427,11 @@ class _RejectingServer(vllm_async_server.vLLMHttpServer):
         raise ValueError("unsupported request")
 
 
-def _make_generating_server(monkeypatch, cls, outputs):
+def _make_generating_server(monkeypatch, cls, outputs, *, dp_size=1):
     server = _make_server(cls=cls)
-    server.config = RolloutConfig(name="vllm", max_model_len=64, prompt_length=32, response_length=16)
+    server.config = RolloutConfig(
+        name="vllm", max_model_len=64, prompt_length=32, response_length=16, data_parallel_size=dp_size
+    )
     server.model_config = SimpleNamespace(processor=None, lora_rank=0, lora={})
     server.replica_rank = 0
     server.engine.outputs = outputs
@@ -453,6 +459,20 @@ def test_default_request_hooks_leave_generate_output_unchanged(monkeypatch):
         assert output.token_ids == [5, 9] and output.stop_reason == "completed"
         assert output.extra_fields == {"global_steps": 7, "num_cached_tokens": 0}
         assert server._admitting == 0
+        assert server.engine.data_parallel_ranks == [None]
+
+    asyncio.run(main())
+
+
+def test_session_identity_pins_new_requests_to_one_data_parallel_engine(monkeypatch):
+    async def main():
+        server = _make_generating_server(
+            monkeypatch, vllm_async_server.vLLMHttpServer, [_request_output([5])], dp_size=4
+        )
+        for request_id in ("turn-1", "turn-2"):
+            await server.generate([1], {"temperature": 1.0}, request_id, session_id="framework-session")
+        first, second = server.engine.data_parallel_ranks
+        assert first == second and 0 <= first < 4
 
     asyncio.run(main())
 
