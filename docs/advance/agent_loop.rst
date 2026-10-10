@@ -226,14 +226,14 @@ For example, in an owner that already implements these steps:
    await owner.fence_replica(replica)
    await replica.restart()
    await owner.reload_weights(replica)
-   await replica._server_handle.snapshot.remote()
+   await replica._server_handle.check_health.remote()
    await owner.publish_replica(replica)
 
-Native verl weight synchronization
-"""""""""""""""""""""""""""""""""
+next_weight_sync recovery
+"""""""""""""""""""""""""
 
 An existing ``CheckpointEngineManager`` can prepare a registered standalone replica
-for recovery without a Relay or a separate weight cache:
+for ``next_weight_sync`` recovery without a Relay or a separate weight cache:
 
 .. code:: python
 

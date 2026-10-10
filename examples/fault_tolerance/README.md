@@ -1,6 +1,7 @@
-# Recover a standalone vLLM replica
+# Recover a standalone vLLM replica with next_weight_sync
 
-This example runs one real optimizer update, kills its rollout replica's
+The `next_weight_sync` recovery strategy runs one real optimizer update, kills
+its rollout replica's
 EngineCore, and restores serving through verl's normal weight synchronization.
 It creates a tiny Qwen2 model locally and needs no dataset or model download.
 

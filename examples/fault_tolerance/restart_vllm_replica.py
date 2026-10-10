@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Recover one standalone TP2 vLLM replica using normal verl weight synchronization.
+"""Recover one standalone TP2 vLLM replica with next_weight_sync.
 
 Requires three CUDA GPUs on one node and a prepared vLLM/NCCL environment.
 Creates a local Ray cluster and a tiny model without downloading a checkpoint.
@@ -354,7 +354,7 @@ def main():
     if args.output_dir:
         output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    result = {"status": "FAIL", "output_dir": str(output)}
+    result = {"status": "FAIL", "weight_recovery": "next_weight_sync", "output_dir": str(output)}
     print(json.dumps({"stage": "setup", "output_dir": str(output)}), flush=True)
     try:
         create_tiny_model(output / "tiny-qwen2")

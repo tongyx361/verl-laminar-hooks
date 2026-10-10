@@ -441,7 +441,7 @@ class CheckpointEngineManager:
 
     @auto_await
     async def restart_replica(self, replica: RolloutReplica, timeout: float = 60.0) -> None:
-        """Rebuild a fenced standalone server and rebind its retained weight receivers.
+        """Stage next_weight_sync recovery and rebind retained weight receivers.
 
         The caller serializes this operation with trainer GPU/optimizer phases.
         The replacement remains paused until a successful, versioned update_weights().

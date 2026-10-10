@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import uuid
+import zlib
 from collections.abc import Mapping
 from contextlib import suppress
 from pprint import pprint
@@ -657,11 +658,13 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
+        session_id: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
+            session_id: Sticky caller id; turns of one session go to the same DP engine.
         """
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
@@ -673,6 +676,7 @@ class vLLMHttpServer:
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
+                session_id=session_id,
             )
 
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -778,6 +782,7 @@ class vLLMHttpServer:
                 request_id=request_id,
                 lora_request=lora_request,
                 priority=priority,
+                data_parallel_rank=self._dp_rank_for_session(session_id),
             )
 
             # Get final response
@@ -878,6 +883,13 @@ class vLLMHttpServer:
         self._pd_peer_idx += 1
         return peer
 
+    def _dp_rank_for_session(self, session_id: Optional[str]) -> Optional[int]:
+        """Pin a session to one DP engine for prefix-cache reuse; hash-based, so it ignores engine load."""
+        dp_size = self.config.data_parallel_size
+        if session_id is None or dp_size <= 1:
+            return None
+        return zlib.crc32(str(session_id).encode()) % dp_size
+
     async def _pd_dispatch(
         self,
         prompt_ids: list[int],
@@ -888,6 +900,7 @@ class vLLMHttpServer:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
+        session_id: Optional[str] = None,
     ) -> TokenOutput:
         """Run prefill locally, then decode on a selected peer."""
         decode_peer = self._select_decode_peer()
@@ -916,6 +929,7 @@ class vLLMHttpServer:
             mm_processor_kwargs=mm_processor_kwargs,
             priority=priority,
             kv_transfer_params=prefill_kv_params,
+            session_id=session_id,
         )
         if is_mooncake:
             # Mooncake does not return decode params from the prefill leg.
@@ -942,6 +956,7 @@ class vLLMHttpServer:
             mm_processor_kwargs=mm_processor_kwargs,
             priority=priority,
             kv_transfer_params=decode_kv_params,
+            session_id=session_id,
         )
 
     async def wake_up(self, tags: list[str] | None = None):
