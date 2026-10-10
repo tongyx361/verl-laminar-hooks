@@ -293,10 +293,19 @@ def test_snapshot_rejects_headless_node_without_touching_engine():
     asyncio.run(main())
 
 
-def test_snapshot_propagates_engine_health_failure_before_reading_stale_gauges():
+def test_health_works_without_metrics_and_snapshot_propagates_engine_failure():
     server = _make_server()
+    assert RolloutConfig().disable_log_stats
+    server.engine.logger_manager = None
+    server.engine.check_health = AsyncMock()
+    server._engine_cleanup = Mock()
+    asyncio.run(server.check_health())
+    server.engine.check_health.assert_awaited_once_with()
+    server._engine_cleanup.record.assert_called_once_with()
+
     failure = EngineDeadError()
-    server.engine.check_health = AsyncMock(side_effect=failure)
+    server.engine.check_health.reset_mock(side_effect=True)
+    server.engine.check_health.side_effect = failure
     # No logger is installed: the failed health check must precede gauge reads.
     with pytest.raises(EngineDeadError) as caught:
         asyncio.run(server.snapshot())
