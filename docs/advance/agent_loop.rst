@@ -260,6 +260,12 @@ If no healthy rollout or queued training data can advance the trainer, invoke th
 existing weight synchronization at that safe boundary before waiting for another
 batch. Recovery does not require another optimizer update or add a transfer channel.
 
+See ``examples/fault_tolerance/restart_vllm_replica.py`` and its README for a
+self-contained three-GPU example that creates a tiny model, injects an owned
+EngineCore failure, and recovers through these APIs. Its sequential requests
+make the traffic fence explicit at the application boundary, and its final
+cleanup releases only the actors and placement group it created.
+
 SGLang
 ^^^^^^
 
