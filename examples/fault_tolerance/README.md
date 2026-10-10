@@ -53,6 +53,9 @@ multi-node recovery and requests interrupted mid-generation are outside its
 scope. Successful generation is a mechanism check, not a PPO or model-quality
 result.
 
+Engine health checks also work with the default `disable_log_stats=True`;
+scheduler metric snapshots are separate from recovery.
+
 NCCL uses `rebuild_group=True`: each normal synchronization finalizes its
 transport group through the native lifecycle. The checkpoint receiver actors
 and their GPU reservations remain in place across serving-engine replacement.

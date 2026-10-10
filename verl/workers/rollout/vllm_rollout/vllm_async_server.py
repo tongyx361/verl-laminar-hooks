@@ -1006,6 +1006,11 @@ class vLLMHttpServer:
         await self.engine.wake_up(tags=["kv_cache"])
         await self.engine.reset_prefix_cache(reset_connector=True)
 
+    async def check_health(self) -> None:
+        """Check the serving engine independently of optional metrics logging."""
+        await self.engine.check_health()
+        self._engine_cleanup.record()
+
     async def snapshot(self) -> dict[str, Any]:
         """Return live KV-cache and scheduler queue observations.
 
@@ -1028,8 +1033,7 @@ class vLLMHttpServer:
                 "vLLMHttpServer.snapshot() requires the node-rank-0 AsyncLLM; "
                 f"node_rank={self.node_rank} actors run headless and have no engine."
             )
-        await self.engine.check_health()
-        self._engine_cleanup.record()
+        await self.check_health()
         prometheus_logger = self._prometheus_logger
         kv_cache_usage = self._prometheus_values(
             prometheus_logger.gauge_kv_cache_usage,

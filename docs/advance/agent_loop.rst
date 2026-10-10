@@ -247,7 +247,8 @@ for recovery without a Relay or a separate weight cache:
 and explicitly binds the existing weight receivers to the new actor handle.
 The replacement stays paused. The next versioned ``update_weights(global_steps)``
 uses the existing full-group topology, trainer export, transport and receiver loading.
-Rebuilt servers must pass their health checks before generation resumes. A failed
+Rebuilt servers must pass their ``check_health()`` calls before generation resumes;
+these checks do not require metrics logging to be enabled. A failed
 load or health check leaves recovery pending; the caller keeps request routing fenced
 until synchronization succeeds and it publishes the new handles and HTTP addresses.
 

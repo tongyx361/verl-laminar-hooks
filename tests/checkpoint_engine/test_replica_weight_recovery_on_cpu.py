@@ -32,7 +32,8 @@ def _make_manager(monkeypatch):
     live_weights = torch.tensor([1.0, 2.0])
     wire = SimpleNamespace(weights=None, version=None)
     new_handle = SimpleNamespace(
-        snapshot=SimpleNamespace(remote=AsyncMock(side_effect=lambda: events.append("health")))
+        check_health=SimpleNamespace(remote=AsyncMock(side_effect=lambda: events.append("health"))),
+        snapshot=SimpleNamespace(remote=AsyncMock(side_effect=RuntimeError("metrics logging is disabled"))),
     )
     receiver = checkpoint_base.CheckpointEngineWorker.__new__(checkpoint_base.CheckpointEngineWorker)
     receiver.server_adapter = ServerAdapter.__new__(ServerAdapter)
@@ -129,6 +130,7 @@ def test_restart_rebinds_target_then_normal_sync_loads_current_trainer_weights(m
     torch.testing.assert_close(adapter.loaded_weights[0][1], torch.tensor([17.0, 17.0]))
     manager.actor_wg.update_weights.assert_called_once_with(global_steps=17, mode="nccl")
     assert manager._pending_restarts == []
+    target.server_handle.snapshot.remote.assert_not_awaited()
     assert target.workers is workers and target.resource_pool is pool
     healthy.restart.assert_not_awaited()
 
@@ -144,7 +146,7 @@ def test_unsupported_restart_has_no_effect_and_failed_health_keeps_target_pendin
     target.rollout_mode = RolloutMode.STANDALONE
     asyncio.run(checkpoint_base.CheckpointEngineManager.restart_replica.__wrapped__(manager, target))
     failure = RuntimeError("replacement engine is unhealthy")
-    target.server_handle.snapshot.remote.side_effect = failure
+    target.server_handle.check_health.remote.side_effect = failure
     with pytest.raises(RuntimeError) as caught:
         asyncio.run(checkpoint_base.CheckpointEngineManager.update_weights.__wrapped__(manager, global_steps=17))
     assert caught.value is failure

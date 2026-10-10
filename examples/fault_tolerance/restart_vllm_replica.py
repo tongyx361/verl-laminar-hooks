@@ -309,7 +309,7 @@ async def run(model_path):
         deadline = time.monotonic() + 30
         while True:
             try:
-                await replica.snapshot()
+                await old_server.check_health.remote()
             except ray.exceptions.RayTaskError as exc:
                 if not isinstance(exc.cause, EngineDeadError):
                     raise
