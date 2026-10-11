@@ -20,6 +20,10 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 from ray.exceptions import ActorDiedError
+
+# The generic CPU extra omits vLLM; vllm.yml runs this module with that backend.
+pytest.importorskip("vllm")
+
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerClient
