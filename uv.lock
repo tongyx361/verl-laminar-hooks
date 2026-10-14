@@ -261,16 +261,36 @@ wheels = [
 [[package]]
 name = "apex"
 version = "0.1"
-source = { registry = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/" }
+source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_aarch64.whl" }
+resolution-markers = [
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
 dependencies = [
-    { name = "packaging" },
+    { name = "packaging", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
 ]
 wheels = [
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.11-torch2.13.0/apex-0.1-cp311-cp311-linux_aarch64.whl" },
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.11-torch2.13.0/apex-0.1-cp311-cp311-linux_x86_64.whl" },
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_aarch64.whl" },
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_x86_64.whl" },
+    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_aarch64.whl", hash = "sha256:2997437749289eb68d35b461b9989cd83bd3299b6eb2da4427bd6e7ca8922988" },
 ]
+
+[package.metadata]
+requires-dist = [{ name = "packaging", specifier = ">20.6" }]
+
+[[package]]
+name = "apex"
+version = "0.1"
+source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_x86_64.whl" }
+resolution-markers = [
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "packaging", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+]
+wheels = [
+    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_x86_64.whl", hash = "sha256:90c555507ea775e947b2d2e77dcec6ddcd8cccd0331cdb6a476691c092eee94c" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "packaging", specifier = ">20.6" }]
 
 [[package]]
 name = "astor"
@@ -2041,9 +2061,9 @@ wheels = [
 [[package]]
 name = "megatron-bridge"
 version = "0.6.2"
-source = { registry = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/" }
+source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/megatron-bridge-v0.6.2-py3.12-torch2.13.0/megatron_bridge-0.6.2-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/megatron-bridge-v0.6.2-py3.12-torch2.13.0/megatron_bridge-0.6.2-py3-none-any.whl" },
+    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/megatron-bridge-v0.6.2-py3.12-torch2.13.0/megatron_bridge-0.6.2-py3-none-any.whl", hash = "sha256:aed51a8d958ebf2dca344aeeb0b2e25dac4f54f571036c1b91735b263e8dc0b6" },
 ]
 
 [[package]]
@@ -5000,23 +5020,84 @@ wheels = [
 [[package]]
 name = "transformer-engine"
 version = "2.16.1"
-source = { registry = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/" }
+source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_aarch64.whl" }
+resolution-markers = [
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
 dependencies = [
+    { name = "einops", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "importlib-metadata", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "nvdlfw-inspect", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "onnx", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "onnxscript", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "packaging", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "pydantic", marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine != 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+]
+wheels = [
+    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_aarch64.whl", hash = "sha256:9a9e56951f4588999fc14c57119193076667a89ee90dbecddca981d151db8bd7" },
+]
+
+[package.metadata]
+requires-dist = [
     { name = "einops" },
-    { name = "importlib-metadata" },
+    { name = "importlib-metadata", specifier = ">=1.0" },
+    { name = "numpy", marker = "extra == 'test'" },
     { name = "nvdlfw-inspect" },
     { name = "onnx" },
+    { name = "onnxruntime", marker = "extra == 'test'" },
+    { name = "onnxruntime-extensions", marker = "extra == 'test'" },
     { name = "onnxscript" },
     { name = "packaging" },
     { name = "pydantic" },
-    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.2.1" },
+    { name = "torch", specifier = ">=2.1" },
+    { name = "torchao", marker = "extra == 'test'", specifier = "==0.13" },
+    { name = "torchvision", marker = "extra == 'test'" },
+    { name = "transformers", marker = "extra == 'test'" },
+]
+provides-extras = ["test"]
+
+[[package]]
+name = "transformer-engine"
+version = "2.16.1"
+source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_x86_64.whl" }
+resolution-markers = [
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "einops", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "importlib-metadata", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "nvdlfw-inspect", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "onnx", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "onnxscript", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "packaging", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "pydantic", marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'x86_64' or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
 ]
 wheels = [
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.11-torch2.13.0/transformer_engine-2.16.1-cp311-cp311-linux_aarch64.whl" },
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.11-torch2.13.0/transformer_engine-2.16.1-cp311-cp311-linux_x86_64.whl" },
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_aarch64.whl" },
-    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_x86_64.whl" },
+    { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_x86_64.whl", hash = "sha256:2e1ad4d7db90c88570aa1c76c01abc3cd81f6ec82aff7bb3eb0cc627aba3c581" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "importlib-metadata", specifier = ">=1.0" },
+    { name = "numpy", marker = "extra == 'test'" },
+    { name = "nvdlfw-inspect" },
+    { name = "onnx" },
+    { name = "onnxruntime", marker = "extra == 'test'" },
+    { name = "onnxruntime-extensions", marker = "extra == 'test'" },
+    { name = "onnxscript" },
+    { name = "packaging" },
+    { name = "pydantic" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.2.1" },
+    { name = "torch", specifier = ">=2.1" },
+    { name = "torchao", marker = "extra == 'test'", specifier = "==0.13" },
+    { name = "torchvision", marker = "extra == 'test'" },
+    { name = "transformers", marker = "extra == 'test'" },
+]
+provides-extras = ["test"]
 
 [[package]]
 name = "transformers"
@@ -5320,7 +5401,8 @@ math = [
 ]
 megatron = [
     { name = "accelerate" },
-    { name = "apex" },
+    { name = "apex", version = "0.1", source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_aarch64.whl" }, marker = "(platform_machine != 'x86_64' and extra != 'extra-4-verl-cpu') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-fsdp') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-megatron') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-sglang') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-vllm') or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "apex", version = "0.1", source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_x86_64.whl" }, marker = "(platform_machine == 'x86_64' and extra != 'extra-4-verl-cpu') or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-fsdp') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-megatron') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-sglang') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-vllm')" },
     { name = "cachetools" },
     { name = "codetiming" },
     { name = "cupy-cuda13x" },
@@ -5365,7 +5447,8 @@ megatron = [
     { name = "torchdata" },
     { name = "torchvision", version = "0.28.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
     { name = "transferqueue" },
-    { name = "transformer-engine" },
+    { name = "transformer-engine", version = "2.16.1", source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_aarch64.whl" }, marker = "(platform_machine != 'x86_64' and extra != 'extra-4-verl-cpu') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-fsdp') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-megatron') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-sglang') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-vllm') or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm')" },
+    { name = "transformer-engine", version = "2.16.1", source = { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_x86_64.whl" }, marker = "(platform_machine == 'x86_64' and extra != 'extra-4-verl-cpu') or (extra == 'extra-4-verl-sglang' and extra == 'extra-4-verl-vllm') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-fsdp') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-megatron') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-sglang') or (extra == 'extra-4-verl-cpu' and extra == 'extra-4-verl-vllm')" },
     { name = "transformers" },
     { name = "trl" },
     { name = "uvicorn" },
@@ -5508,7 +5591,9 @@ vllm = [
 requires-dist = [
     { name = "accelerate" },
     { name = "accelerate", marker = "extra == 'verl-core'" },
-    { name = "apex", marker = "extra == 'megatron'", index = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/" },
+    { name = "apex", marker = "platform_machine == 'aarch64' and extra == 'megatron'", url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_aarch64.whl" },
+    { name = "apex", marker = "platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'megatron'" },
+    { name = "apex", marker = "platform_machine == 'x86_64' and extra == 'megatron'", url = "https://github.com/verl-project/verl-wheelhouse/releases/download/apex-master-py3.12-torch2.13.0/apex-0.1-cp312-cp312-linux_x86_64.whl" },
     { name = "cachetools", marker = "extra == 'verl-core'" },
     { name = "codetiming" },
     { name = "codetiming", marker = "extra == 'verl-core'" },
@@ -5531,7 +5616,7 @@ requires-dist = [
     { name = "math-verify", marker = "extra == 'math'" },
     { name = "mathruler", marker = "extra == 'verl-core'" },
     { name = "matplotlib", marker = "extra == 'megatron'" },
-    { name = "megatron-bridge", marker = "extra == 'megatron'", specifier = "==0.6.2", index = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/" },
+    { name = "megatron-bridge", marker = "extra == 'megatron'", url = "https://github.com/verl-project/verl-wheelhouse/releases/download/megatron-bridge-v0.6.2-py3.12-torch2.13.0/megatron_bridge-0.6.2-py3-none-any.whl" },
     { name = "megatron-core", marker = "extra == 'cpu'", git = "https://github.com/NVIDIA/Megatron-LM.git?tag=core_v0.19.2" },
     { name = "megatron-core", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/Megatron-LM.git?tag=core_v0.19.2" },
     { name = "megatron-energon", marker = "extra == 'megatron'", specifier = "==7.4.1" },
@@ -5600,7 +5685,9 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'sglang'", specifier = "==0.28.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "verl", extra = "sglang" } },
     { name = "torchvision", marker = "extra == 'vllm'", specifier = "==0.28.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "verl", extra = "vllm" } },
     { name = "transferqueue", marker = "extra == 'verl-core'", specifier = ">=0.1.11" },
-    { name = "transformer-engine", marker = "extra == 'megatron'", index = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/" },
+    { name = "transformer-engine", marker = "platform_machine == 'aarch64' and extra == 'megatron'", url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_aarch64.whl" },
+    { name = "transformer-engine", marker = "platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'megatron'" },
+    { name = "transformer-engine", marker = "platform_machine == 'x86_64' and extra == 'megatron'", url = "https://github.com/verl-project/verl-wheelhouse/releases/download/transformer-engine-v2.16.1-py3.12-torch2.13.0/transformer_engine-2.16.1-cp312-cp312-linux_x86_64.whl" },
     { name = "transformers", specifier = ">=5.5.3,!=5.6.0,<5.13" },
     { name = "transformers", marker = "extra == 'cpu'", specifier = "==5.12.1" },
     { name = "transformers", marker = "extra == 'sglang'", specifier = "==5.12.1" },
