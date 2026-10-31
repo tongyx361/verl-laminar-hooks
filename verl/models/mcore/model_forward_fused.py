@@ -16,8 +16,9 @@
 
 import inspect
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import megatron.core as mcore
 import torch
@@ -100,6 +101,12 @@ class FusedOutputProcessorContext:
 
     temperature: float
     impl_backend: str = "triton"
+    logits_processor_func: Callable | None = None
+    batch: Any = None
+    score_centering: bool = False
+    quant_align_size: int | None = None
+    cp_layout: str = "zigzag"
+    local_cp_size: int | None = None
 
 
 def fused_output_processor(
@@ -136,6 +143,18 @@ def fused_output_processor(
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=context.impl_backend,
     )
+    if context.score_centering and context.logits_processor_func is not None:
+        hidden_2d = hidden_states.view(-1, hidden_states.shape[-1])
+        output.extra_outputs = context.logits_processor_func(
+            hidden_states=hidden_2d,
+            output_weight=weight,
+            temperature=temperature,
+            data=context.batch,
+            data_format="thd",
+            quant_align_size=context.quant_align_size,
+            cp_layout=context.cp_layout,
+            local_cp_size=context.local_cp_size,
+        )
 
     if has_config_logger_enabled(config):
         payload = OrderedDict(
@@ -284,6 +303,9 @@ def fused_forward_model_engine(vision_model: bool = False):
         router_padding_mask: Tensor | None = None,
         pad_to_length_bucket: int | None = None,
         position_ids: Tensor | None = None,
+        score_centering: bool = False,
+        logits_processor_func: Callable | None = None,
+        batch: Any = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
@@ -351,6 +373,12 @@ def fused_forward_model_engine(vision_model: bool = False):
                 output_processor_context=FusedOutputProcessorContext(
                     temperature=temperature,
                     impl_backend=impl_backend,
+                    logits_processor_func=logits_processor_func,
+                    batch=batch,
+                    score_centering=score_centering,
+                    quant_align_size=quant_align_size,
+                    cp_layout=cp_layout,
+                    local_cp_size=local_cp_size,
                 ),
             )
         else:
@@ -358,6 +386,12 @@ def fused_forward_model_engine(vision_model: bool = False):
             output_orig: CausalLMOutputForPPO = model(
                 temperature=temperature,
                 impl_backend=impl_backend,
+                score_centering=score_centering,
+                logits_processor_func=logits_processor_func,
+                batch=batch,
+                quant_align_size=quant_align_size,
+                cp_layout=cp_layout,
+                local_cp_size=local_cp_size,
                 **forward_kwargs,
             )
 
@@ -394,6 +428,20 @@ def fused_forward_model_engine(vision_model: bool = False):
             )
             output["entropy"] = entropy
 
+        if output_orig.extra_outputs:
+            for k, v in output_orig.extra_outputs.items():
+                if v.dim() == 1:
+                    v = v.unsqueeze(0)
+                output[k] = postprocess_thd_engine(
+                    v,
+                    packed_seq_params,
+                    input_ids,
+                    input_ids.shape[0],
+                    post_process=post_process,
+                    cp_layout=cp_layout,
+                    local_cp_size=local_cp_size,
+                )
+
         return output
 
     return fused_forward_model_engine_inner
@@ -416,6 +464,12 @@ def _fused_GPTModel_forward(
     temperature: float = 1.0,
     impl_backend: str = "triton",
     padding_mask: Tensor | None = None,
+    score_centering: bool = False,
+    logits_processor_func: Callable | None = None,
+    batch: Any = None,
+    quant_align_size: int | None = None,
+    cp_layout: str = "zigzag",
+    local_cp_size: int | None = None,
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
@@ -495,6 +549,18 @@ def _fused_GPTModel_forward(
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=impl_backend,
     )
+    if score_centering and logits_processor_func is not None:
+        hidden_2d = hidden_states.view(-1, hidden_states.shape[-1])
+        output.extra_outputs = logits_processor_func(
+            hidden_states=hidden_2d,
+            output_weight=output_weight,
+            temperature=temperature,
+            data=batch,
+            data_format="thd",
+            quant_align_size=quant_align_size,
+            cp_layout=cp_layout,
+            local_cp_size=local_cp_size,
+        )
 
     if has_config_logger_enabled(model.config):
         payload = OrderedDict(

@@ -182,6 +182,92 @@ def topk_log_probs_from_logits(
     return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size, process_group)
 
 
+class _TopKLogProbsFromHiddenAndWeight(torch.autograd.Function):
+    """Chunked LM-head projection + top-k log_softmax without materializing full (N, V) logits.
+
+    Saves only ``hidden_states`` (N, H), ``output_weight`` (V, H), ``token_ids`` (N, k), and two
+    fp32 scalars per row; recomputes the chunked LM-head projection and softmax in backward.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, output_weight, token_ids, temperature, chunk_size):
+        n = hidden_states.shape[0]
+        chunk_size = chunk_size if chunk_size > 0 else max(n, 1)
+        output = torch.empty(token_ids.shape, device=hidden_states.device, dtype=torch.float32)
+        maxima = torch.empty((n, 1), device=hidden_states.device, dtype=torch.float32)
+        denominators = torch.empty_like(maxima)
+        temp_val = max(float(temperature), 1e-8)
+        temp_t = torch.tensor(temp_val, device=hidden_states.device, dtype=hidden_states.dtype)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            logits_chunk = torch.nn.functional.linear(hidden_states[start:end], output_weight)
+            if temp_val != 1.0:
+                logits_chunk.div_(temp_t)
+            work = logits_chunk.to(dtype=torch.float32, copy=True)
+            del logits_chunk
+            maximum = work.max(dim=-1, keepdim=True).values
+            targets = work.gather(-1, token_ids[start:end])
+            work.sub_(maximum).exp_()
+            denominator = work.sum(dim=-1, keepdim=True)
+            output[start:end] = (targets - maximum) - denominator.log()
+            maxima[start:end] = maximum
+            denominators[start:end] = denominator
+            del work
+        ctx.save_for_backward(hidden_states, output_weight, token_ids, maxima, denominators)
+        ctx.temperature = temp_val
+        ctx.chunk_size = chunk_size
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        hidden_states, output_weight, token_ids, maxima, denominators = ctx.saved_tensors
+        n = hidden_states.shape[0]
+        temp_val = ctx.temperature
+        temp_t = torch.tensor(temp_val, device=hidden_states.device, dtype=hidden_states.dtype)
+        grad_hidden = torch.empty_like(hidden_states) if ctx.needs_input_grad[0] else None
+        grad_weight = (
+            torch.zeros_like(output_weight, dtype=torch.float32) if ctx.needs_input_grad[1] else None
+        )
+        for start in range(0, n, ctx.chunk_size):
+            end = min(start + ctx.chunk_size, n)
+            h_chunk = hidden_states[start:end]
+            logits_chunk = torch.nn.functional.linear(h_chunk, output_weight)
+            if temp_val != 1.0:
+                logits_chunk.div_(temp_t)
+            work = logits_chunk.to(dtype=torch.float32, copy=True)
+            del logits_chunk
+            work.sub_(maxima[start:end]).exp_().div_(denominators[start:end])
+            grad = grad_output[start:end].float()
+            work.mul_(-grad.sum(dim=-1, keepdim=True))
+            work.scatter_add_(-1, token_ids[start:end], grad)
+            grad_logits = work.to(dtype=hidden_states.dtype)
+            if temp_val != 1.0:
+                grad_logits.div_(temp_t)
+            del work
+            if grad_hidden is not None:
+                grad_hidden[start:end] = torch.matmul(grad_logits, output_weight)
+            if grad_weight is not None:
+                grad_weight.add_(torch.matmul(grad_logits.t(), h_chunk).float())
+            del grad_logits
+        if grad_weight is not None:
+            grad_weight = grad_weight.to(dtype=output_weight.dtype)
+        return grad_hidden, grad_weight, None, None, None
+
+
+def topk_log_probs_from_hidden_and_weight(
+    hidden_states: torch.Tensor,
+    output_weight: torch.Tensor,
+    token_ids: torch.Tensor,
+    temperature: float = 1.0,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Compute full-vocab-normalized top-k log-probs directly from hidden states and LM head weight."""
+    return _TopKLogProbsFromHiddenAndWeight.apply(
+        hidden_states, output_weight, token_ids.long(), float(temperature), chunk_size
+    )
+
+
 def score_centering_weight_fn(
     rollout_is: Optional[str], rollout_is_threshold: str | float
 ) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -335,15 +421,19 @@ def score_centering_auto_correction(
 
 
 def score_centering_logits_processor(
-    student_logits: torch.Tensor,
-    data: TensorDict,
-    config: ActorConfig,
+    student_logits: torch.Tensor | None = None,
+    data: TensorDict = None,
+    config: ActorConfig = None,
     data_format: str = "thd",
     quant_align_size: Optional[int] = None,
     cp_layout: str = "zigzag",
     local_cp_size: Optional[int] = None,
+    *,
+    hidden_states: torch.Tensor | None = None,
+    output_weight: torch.Tensor | None = None,
+    temperature: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Per-token centering term from the trainer logits, in the engine's logits-processor slot.
+    """Per-token centering term from the trainer logits or hidden states, in the engine's logits-processor slot.
 
     Args:
         student_logits: Trainer logits, already temperature-scaled, shape (1, nnz/sp, V); under the
@@ -357,7 +447,7 @@ def score_centering_logits_processor(
 
     Returns:
         Dict with, each of shape (1, nnz/sp):
-            sc_correction: Centering term, with gradient to ``student_logits``.
+            sc_correction: Centering term, with gradient to ``student_logits`` or ``hidden_states``/``output_weight``.
             sc_sampler_head_mass: Sampler's head probability mass, detached.
             sc_train_head_mass: Trainer's head probability mass, detached.
             sc_log_support_mass: Trainer's log support mass for aligned rows, zero otherwise.
@@ -396,9 +486,22 @@ def score_centering_logits_processor(
     weight_fn = score_centering_weight_fn(
         rollout_correction.get("rollout_is", None), rollout_correction.get("rollout_is_threshold", 2.0)
     )
-    train_head_log_probs = topk_log_probs_from_logits(
-        student_logits.squeeze(0), topk_ids.squeeze(0), process_group=process_group
-    )
+    if hidden_states is not None:
+        if output_weight is None:
+            raise ValueError("output_weight is required for fused Score Centering")
+        if config.strategy == "megatron":
+            from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+
+            if get_tensor_model_parallel_world_size() != 1:
+                raise NotImplementedError("fused Score Centering requires tensor_model_parallel_size=1")
+        assert topk_log_probs.shape[:2] == topk_ids.shape[:2] == (1, hidden_states.shape[0])
+        train_head_log_probs = topk_log_probs_from_hidden_and_weight(
+            hidden_states, output_weight, topk_ids.squeeze(0), temperature=temperature
+        )
+    else:
+        train_head_log_probs = topk_log_probs_from_logits(
+            student_logits.squeeze(0), topk_ids.squeeze(0), process_group=process_group
+        )
     complete = support_complete.squeeze(0)
     correction, log_support_mass, sampler_head_mass, train_head_mass = score_centering_auto_correction(
         train_head_log_probs, topk_log_probs.squeeze(0), weight_fn, complete
@@ -425,10 +528,14 @@ def score_centering_ppo_loss(
     quant_align_size: Optional[int] = None,
     cp_layout: str = "zigzag",
     local_cp_size: Optional[int] = None,
+    *,
+    hidden_states: torch.Tensor | None = None,
+    output_weight: torch.Tensor | None = None,
+    temperature: float = 1.0,
 ):
     """Actor loss function used both for the logits processor and the final policy loss.
-    - student_logits is not None, compute the centering term in the logits processor.
-    - student_logits is None, compute the final policy loss.
+    - student_logits is not None or hidden_states is not None: compute the centering term in the logits processor.
+    - otherwise: compute the final policy loss.
 
     Args:
         config: Actor configuration.
@@ -441,10 +548,10 @@ def score_centering_ppo_loss(
             ``score_centering_logits_processor``.
 
     Returns:
-        student_logits is not None: dict from ``score_centering_logits_processor``.
-        student_logits is None: the (loss, metrics) tuple from ``ppo_loss``.
+        student_logits is not None or hidden_states is not None: dict from ``score_centering_logits_processor``.
+        otherwise: the (loss, metrics) tuple from ``ppo_loss``.
     """
-    if student_logits is not None:
+    if student_logits is not None or hidden_states is not None:
         return score_centering_logits_processor(
             student_logits,
             data,
@@ -453,6 +560,9 @@ def score_centering_ppo_loss(
             quant_align_size=quant_align_size,
             cp_layout=cp_layout,
             local_cp_size=local_cp_size,
+            hidden_states=hidden_states,
+            output_weight=output_weight,
+            temperature=temperature,
         )
     rollout_correction = config.policy_loss.get("rollout_correction", None) or {}
     if rollout_correction.get("score_centering", False) and "sc_correction" not in model_output:

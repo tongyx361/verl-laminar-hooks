@@ -916,3 +916,73 @@ def test_score_centering_loss_rejects_missing_correction():
     config = _actor_config(RolloutCorrectionConfig.bypass_pg_token_tis_sc())
     with pytest.raises(RuntimeError, match="logits processor did not run"):
         score_centering_ppo_loss(config, model_output={"log_probs": torch.zeros(1, 2)}, data=None)
+
+
+def test_megatron_fused_score_centering_matches_materialized_logits(monkeypatch):
+    from verl.trainer.ppo import score_centering as sc_mod
+    from verl.workers.config import McoreActorConfig
+
+    config = McoreActorConfig(
+        strategy="megatron",
+        rollout_n=1,
+        use_dynamic_bsz=True,
+        policy_loss=PolicyLossConfig(
+            loss_mode="bypass_mode",
+            rollout_correction=RolloutCorrectionConfig.bypass_pg_sc(),
+        ),
+    )
+
+    monkeypatch.setattr("megatron.core.parallel_state.get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr("megatron.core.parallel_state.get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr("megatron.core.parallel_state.get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr("megatron.core.parallel_state.get_context_parallel_rank", lambda: 0)
+
+    torch.manual_seed(11)
+    n, h, vocab, k = 10, 8, 24, 4
+    temperature = 1.25
+    hidden_ref = torch.randn(n, h, dtype=torch.float32, requires_grad=True)
+    weight_ref = torch.randn(vocab, h, dtype=torch.float32, requires_grad=True)
+    hidden_fused = hidden_ref.detach().clone().requires_grad_(True)
+    weight_fused = weight_ref.detach().clone().requires_grad_(True)
+
+    topk_ids = torch.nested.nested_tensor_from_jagged(
+        torch.randint(0, vocab, (n, k), dtype=torch.int32),
+        offsets=torch.tensor([0, 4, n]),
+    )
+    topk_log_probs = torch.nested.nested_tensor_from_jagged(
+        torch.full((n, k), -2.5, dtype=torch.float32),
+        offsets=torch.tensor([0, 4, n]),
+    )
+    batch = TensorDict(
+        {
+            "rollout_topk_ids": topk_ids,
+            "rollout_topk_log_probs": topk_log_probs,
+        },
+        batch_size=[2],
+    )
+
+    logits_ref = torch.nn.functional.linear(hidden_ref, weight_ref) / temperature
+    out_ref = sc_mod.score_centering_ppo_loss(
+        config,
+        student_logits=logits_ref.unsqueeze(0),
+        data=batch,
+        data_format="thd",
+    )
+    out_fused = sc_mod.score_centering_ppo_loss(
+        config,
+        hidden_states=hidden_fused,
+        output_weight=weight_fused,
+        temperature=temperature,
+        data=batch,
+        data_format="thd",
+    )
+
+    torch.testing.assert_close(out_fused["sc_correction"], out_ref["sc_correction"])
+    torch.testing.assert_close(out_fused["sc_sampler_head_mass"], out_ref["sc_sampler_head_mass"])
+    torch.testing.assert_close(out_fused["sc_train_head_mass"], out_ref["sc_train_head_mass"])
+
+    upstream = torch.randn_like(out_ref["sc_correction"])
+    (out_ref["sc_correction"] * upstream).sum().backward()
+    (out_fused["sc_correction"] * upstream).sum().backward()
+    torch.testing.assert_close(hidden_fused.grad, hidden_ref.grad)
+    torch.testing.assert_close(weight_fused.grad, weight_ref.grad)
