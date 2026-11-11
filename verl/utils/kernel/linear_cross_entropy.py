@@ -227,10 +227,12 @@ def linear_cross_entropy(
     dist_process_group: typing.Optional[dist.ProcessGroup] = None,
     *,
     impl_backend: str = "triton",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused linear + cross-entropy (+ token entropy).
+    topk_ids: typing.Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused linear + cross-entropy (+ token entropy), plus optional top-k log-probabilities.
 
-    Always returns ``(logprobs, entropy)``. On Ascend NPU, dispatches to CANN
+    Returns ``(logprobs, entropy)`` by default, or ``(logprobs, entropy, topk_log_probs)``
+    when ``topk_ids`` is supplied. On Ascend NPU, dispatches to CANN
     vocab-parallel fused CE when available (``VERL_NPU_LCE_BACKEND=auto|cann``).
     Hybrid backward: CANN CE when ``dentropy==0``; chunked PyTorch CE+entropy
     (Triton-aligned) when ``dentropy!=0``.
@@ -242,6 +244,19 @@ def linear_cross_entropy(
         temperature = 1.0
     if reduction is None:
         reduction = "none"
+    if topk_ids is not None:
+        if str(reduction).lower() != "none":
+            raise NotImplementedError("topk_ids with linear_cross_entropy supports reduction='none' only")
+        from verl.trainer.ppo.score_centering import topk_and_sampled_log_probs_from_hidden
+
+        return topk_and_sampled_log_probs_from_hidden(
+            hidden,
+            weight,
+            labels,
+            topk_ids,
+            temperature=float(temperature),
+            process_group=dist_process_group,
+        )
     if impl_backend == "triton":
         if hidden.device.type == "npu":
             from verl.utils.kernel.npu.cann_linear_ce import CannLinearCrossEntropy, should_use_cann_linear_ce

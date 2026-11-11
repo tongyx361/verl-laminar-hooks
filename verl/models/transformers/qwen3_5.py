@@ -555,6 +555,7 @@ def qwen3_5_base_forward(
 class Qwen3_5CausalLMOutputForPPO(Qwen3_5CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    topk_log_probs: Optional[torch.FloatTensor] = None
 
 
 def forward_with_normal_backend(
@@ -587,6 +588,7 @@ def forward_with_torch_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -620,15 +622,19 @@ def forward_with_torch_backend(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
     hidden_states = hidden_states.to(vocab_weights.dtype)  # bf16 to float
-    log_probs, entropy = fused_linear_for_ppo.forward(
+    fused_out = fused_linear_for_ppo.forward(
         hidden_states=hidden_states,
         vocab_weights=vocab_weights,
         input_ids=rolled_labels,
         temperature=temperature,
+        topk_ids=topk_ids,
     )
+    log_probs, entropy = fused_out[:2]
+    topk_log_probs = fused_out[2] if len(fused_out) == 3 else None
     return Qwen3_5CausalLMOutputForPPO(
         log_probs=log_probs,
         entropy=entropy,
+        topk_log_probs=topk_log_probs,
         hidden_states=outputs.hidden_states,
     )
 
@@ -641,6 +647,7 @@ def forward_with_triton_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -673,15 +680,19 @@ def forward_with_triton_backend(
     if isinstance(vocab_weights, DTensor):
         vocab_weights = vocab_weights.full_tensor()
 
-    log_probs, entropy = linear_cross_entropy(
+    fused_out = linear_cross_entropy(
         hidden_states,
         vocab_weights,
         rolled_labels,
         temperature,
         "none",
+        topk_ids=topk_ids,
     )
+    log_probs, entropy = fused_out[:2]
+    topk_log_probs = fused_out[2] if len(fused_out) == 3 else None
     return Qwen3_5CausalLMOutputForPPO(
         log_probs=log_probs,
         entropy=entropy,
+        topk_log_probs=topk_log_probs,
         hidden_states=outputs.hidden_states,
     )

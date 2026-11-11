@@ -37,6 +37,7 @@ from verl.trainer.ppo.score_centering import (
     score_centering_ppo_loss,
     score_centering_support_correction,
     score_centering_weight_fn,
+    topk_and_sampled_log_probs_from_hidden,
     topk_log_probs_from_logits,
 )
 from verl.utils import tensordict_utils as tu
@@ -148,6 +149,20 @@ def test_score_centering_config_accepts_megatron_actor():
     _validate_score_centering_config(_config(**{"actor_rollout_ref.actor.strategy": "megatron"}))
 
 
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+@pytest.mark.parametrize("use_fused_kernels", [True, False])
+def test_score_centering_config_accepts_fsdp_fused_and_eager(strategy, use_fused_kernels):
+    _validate_score_centering_config(
+        _config(
+            **{
+                "actor_rollout_ref.actor.strategy": strategy,
+                "actor_rollout_ref.model.use_remove_padding": True,
+                "actor_rollout_ref.model.use_fused_kernels": use_fused_kernels,
+            }
+        )
+    )
+
+
 def test_score_centering_config_skips_checks_when_off():
     _validate_score_centering_config(
         _config(
@@ -167,6 +182,43 @@ def test_score_centering_config_skips_checks_when_off():
         (dict(actor_rc={"rollout_is_threshold": 3.0}), "match"),
         ({"trainer.use_v1": False}, "use_v1"),
         ({"actor_rollout_ref.actor.strategy": "veomni"}, "strategy"),
+        (
+            {
+                "actor_rollout_ref.model.use_fused_kernels": True,
+                "actor_rollout_ref.model.use_remove_padding": False,
+            },
+            "use_remove_padding=True",
+        ),
+        (
+            {
+                "actor_rollout_ref.actor.strategy": "megatron",
+                "actor_rollout_ref.model.use_remove_padding": False,
+            },
+            "use_remove_padding=True",
+        ),
+        (
+            {
+                "actor_rollout_ref.actor.strategy": "megatron",
+                "actor_rollout_ref.model.use_fused_kernels": True,
+            },
+            "use_fused_kernels=True",
+        ),
+        ({"actor_rollout_ref.actor.pad_to_length": True}, "pad_to_length"),
+        ({"actor_rollout_ref.actor.fsdp_config.pad_to_length": True}, "pad_to_length"),
+        (
+            {
+                "actor_rollout_ref.model.use_fused_kernels": True,
+                "actor_rollout_ref.actor.calculate_sum_pi_squared": True,
+            },
+            "calculate_sum_pi_squared",
+        ),
+        (
+            {
+                "actor_rollout_ref.model.use_fused_kernels": True,
+                "actor_rollout_ref.actor.fsdp_config.batch_invariant": True,
+            },
+            "batch_invariant",
+        ),
         ({"actor_rollout_ref.rollout.name": "sglang"}, "vllm"),
         ({"actor_rollout_ref.rollout.topk_log_probs": 0}, "topk_log_probs"),
         ({"actor_rollout_ref.rollout.temperature": 0}, "temperature"),
@@ -231,6 +283,126 @@ def test_topk_log_probs_vocab_parallel_matches_single_shard(tmp_path):
     for shard in shards:
         torch.testing.assert_close(shard["out"], ref.detach())
     torch.testing.assert_close(torch.cat([s["grad"] for s in shards], dim=-1), logits.grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("temperature", [1.0, 0.8])
+def test_topk_and_sampled_log_probs_from_hidden_matches_dense_forward_and_backward(dtype, temperature):
+    torch.manual_seed(7)
+    num_tokens, hidden_dim, vocab_size, k = 9, 16, 29, 5
+    hidden = torch.randn(1, num_tokens, hidden_dim, dtype=dtype, requires_grad=True)
+    weight = torch.randn(vocab_size, hidden_dim, dtype=dtype, requires_grad=True)
+    labels = torch.randint(0, vocab_size, (1, num_tokens))
+    labels[0, 3] = -100
+    labels[0, -1] = -100
+    topk_ids = torch.stack([torch.randperm(vocab_size)[:k] for _ in range(num_tokens)]).unsqueeze(0)
+    topk_ids[0, 3] = -1  # ignored target rows may hold negative sentinels
+
+    lp, ent, head_lp = topk_and_sampled_log_probs_from_hidden(
+        hidden, weight, labels, topk_ids, temperature=temperature, chunk_size=3, ignore_index=-100
+    )
+
+    hidden_ref = hidden.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    logits_ref = (hidden_ref.reshape(-1, hidden_dim) @ weight_ref.t()).float() / temperature
+    full_logp = logits_ref.log_softmax(dim=-1)
+    valid = labels.reshape(-1) != -100
+    safe_ids = torch.where(valid.unsqueeze(-1), topk_ids.reshape(num_tokens, k), 0)
+    lp_ref = torch.where(valid, full_logp.gather(-1, labels.reshape(-1).clamp(min=0).unsqueeze(-1)).squeeze(-1), 0.0)
+    ent_ref = torch.where(valid, -(full_logp.exp() * full_logp).sum(dim=-1), 0.0)
+    head_lp_ref = torch.where(valid.unsqueeze(-1), full_logp.gather(-1, safe_ids), 0.0).view(1, num_tokens, k)
+
+    torch.testing.assert_close(lp, lp_ref.view_as(labels), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(ent, ent_ref.view_as(labels), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(head_lp, head_lp_ref, atol=1e-5, rtol=1e-5)
+
+    w_lp = torch.randn_like(lp)
+    w_ent = torch.randn_like(ent)
+    w_head = torch.randn_like(head_lp)
+    ((lp * w_lp).sum() + (ent * w_ent).sum() + (head_lp * w_head).sum()).backward()
+    (
+        (lp_ref.view_as(labels) * w_lp).sum() + (ent_ref.view_as(labels) * w_ent).sum() + (head_lp_ref * w_head).sum()
+    ).backward()
+
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    rtol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(hidden.grad.float(), hidden_ref.grad.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(weight.grad.float(), weight_ref.grad.float(), atol=atol, rtol=rtol)
+
+
+def _vocab_parallel_hidden_topk_worker(rank, world_size, rendezvous_file, out_dir):
+    dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous_file}", rank=rank, world_size=world_size)
+    try:
+        torch.manual_seed(17)
+        num_tokens, hidden_dim, vocab_size, k = 9, 12, 24, 5
+        hidden = torch.randn(1, num_tokens, hidden_dim, dtype=torch.float32, requires_grad=True)
+        full_weight = torch.randn(vocab_size, hidden_dim, dtype=torch.float32)
+        labels = torch.randint(0, vocab_size, (1, num_tokens))
+        labels[0, 2] = -100
+        topk_ids = torch.stack([torch.randperm(vocab_size)[:k] for _ in range(num_tokens)]).unsqueeze(0)
+        topk_ids[0, 0, 1] = topk_ids[0, 0, 0]
+        w_lp = torch.randn(1, num_tokens)
+        w_ent = torch.randn(1, num_tokens)
+        w_head = torch.randn(1, num_tokens, k)
+
+        local_vocab = vocab_size // world_size
+        weight_shard = full_weight[rank * local_vocab : (rank + 1) * local_vocab].clone().requires_grad_(True)
+        lp, ent, head_lp = topk_and_sampled_log_probs_from_hidden(
+            hidden,
+            weight_shard,
+            labels,
+            topk_ids,
+            temperature=0.8,
+            chunk_size=3,
+            ignore_index=-100,
+            process_group=dist.group.WORLD,
+        )
+        ((lp * w_lp).sum() + (ent * w_ent).sum() + (head_lp * w_head).sum()).backward()
+        torch.save(
+            {
+                "lp": lp.detach(),
+                "ent": ent.detach(),
+                "head": head_lp.detach(),
+                "dhidden": hidden.grad.detach(),
+                "dweight": weight_shard.grad.detach(),
+            },
+            f"{out_dir}/hidden_rank{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_topk_and_sampled_log_probs_from_hidden_vocab_parallel_matches_single_shard(tmp_path):
+    world_size = 2
+    mp.spawn(
+        _vocab_parallel_hidden_topk_worker,
+        args=(world_size, str(tmp_path / "rdzv_hidden"), str(tmp_path)),
+        nprocs=world_size,
+    )
+    torch.manual_seed(17)
+    num_tokens, hidden_dim, vocab_size, k = 9, 12, 24, 5
+    hidden = torch.randn(1, num_tokens, hidden_dim, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(vocab_size, hidden_dim, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, vocab_size, (1, num_tokens))
+    labels[0, 2] = -100
+    topk_ids = torch.stack([torch.randperm(vocab_size)[:k] for _ in range(num_tokens)]).unsqueeze(0)
+    topk_ids[0, 0, 1] = topk_ids[0, 0, 0]
+    w_lp = torch.randn(1, num_tokens)
+    w_ent = torch.randn(1, num_tokens)
+    w_head = torch.randn(1, num_tokens, k)
+
+    lp_ref, ent_ref, head_ref = topk_and_sampled_log_probs_from_hidden(
+        hidden, weight, labels, topk_ids, temperature=0.8, chunk_size=3, ignore_index=-100
+    )
+    ((lp_ref * w_lp).sum() + (ent_ref * w_ent).sum() + (head_ref * w_head).sum()).backward()
+
+    shards = [torch.load(tmp_path / f"hidden_rank{r}.pt") for r in range(world_size)]
+    for shard in shards:
+        torch.testing.assert_close(shard["lp"], lp_ref.detach(), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(shard["ent"], ent_ref.detach(), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(shard["head"], head_ref.detach(), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(shard["dhidden"], hidden.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(torch.cat([s["dweight"] for s in shards], dim=0), weight.grad, atol=1e-5, rtol=1e-5)
 
 
 def test_correction_is_zero_on_policy():

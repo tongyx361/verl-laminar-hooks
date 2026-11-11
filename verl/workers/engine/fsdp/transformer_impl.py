@@ -1254,6 +1254,21 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # shard boundary rather than the global sequence (issue #6068). This
                 # mirrors what the veomni engine already does for fused kernels.
                 extra_args["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+            if score_centering:
+                if not use_remove_padding:
+                    raise NotImplementedError(
+                        "score_centering=True with use_fused_kernels=True requires use_remove_padding=True."
+                    )
+                if distillation_use_topk:
+                    raise ValueError("score centering cannot be combined with top-k distillation")
+                from verl.trainer.ppo.score_centering import pack_ulysses_topk_ids
+
+                extra_args["topk_ids"] = pack_ulysses_topk_ids(
+                    micro_batch["rollout_topk_ids"],
+                    micro_batch["input_ids"],
+                    output_args["pad_size"],
+                    use_ulysses_sp=self.use_ulysses_sp,
+                )
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
@@ -1277,10 +1292,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
-        if score_centering and use_fused_kernels:
+        if score_centering and use_fused_kernels and not use_remove_padding:
             raise NotImplementedError(
-                "score_centering=True is not supported with use_fused_kernels=True: "
-                "fused kernels do not materialize the full logits tensor score centering needs."
+                "score_centering=True with use_fused_kernels=True requires use_remove_padding=True."
             )
 
         model_output = {}
@@ -1316,6 +1330,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             v = getattr(aux_outputs, field_name).squeeze(0)
                             v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
+                if score_centering:
+                    aux_outputs = getattr(output, "fused_linear_aux", None)
+                    head_log_probs = getattr(output, "topk_log_probs", None)
+                    if head_log_probs is None and aux_outputs is not None:
+                        head_log_probs = getattr(aux_outputs, "topk_log_probs", None)
+                    if head_log_probs is None:
+                        raise RuntimeError(
+                            "Fused score centering did not produce topk_log_probs: verify that the model ran "
+                            "a supported fused LM-head kernel with topk_ids."
+                        )
+                    if head_log_probs.ndim == 3:
+                        head_log_probs = head_log_probs.squeeze(0)
+                    sc_outputs = logits_processor_func(
+                        student_logits=None, train_head_log_probs=head_log_probs, data=micro_batch
+                    )
+                    cu_seqlens = input_ids.offsets()
+                    for k, v in sc_outputs.items():
+                        v = v.squeeze(0)
+                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.

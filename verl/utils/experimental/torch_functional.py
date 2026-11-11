@@ -232,8 +232,20 @@ class FusedLinearForPPO(torch.nn.Module):
         vocab_weights: torch.FloatTensor,
         input_ids: torch.LongTensor,
         temperature: float = 1.0,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        topk_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor] | tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         input_ids = input_ids.to(torch.int64)
+        if topk_ids is not None:
+            from verl.trainer.ppo.score_centering import topk_and_sampled_log_probs_from_hidden
+
+            return topk_and_sampled_log_probs_from_hidden(
+                hidden_states,
+                vocab_weights,
+                input_ids,
+                topk_ids,
+                temperature=temperature,
+                chunk_size=self.chunk_size,
+            )
         if self.impl_backend == "torch" or _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY is None:
             return FusedLinearForPPOFunction.apply(
                 hidden_states,
