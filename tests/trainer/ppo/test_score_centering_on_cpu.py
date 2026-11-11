@@ -149,9 +149,9 @@ def test_score_centering_config_accepts_megatron_actor():
     _validate_score_centering_config(_config(**{"actor_rollout_ref.actor.strategy": "megatron"}))
 
 
-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "megatron"])
 @pytest.mark.parametrize("use_fused_kernels", [True, False])
-def test_score_centering_config_accepts_fsdp_fused_and_eager(strategy, use_fused_kernels):
+def test_score_centering_config_accepts_fsdp_and_megatron_fused_and_eager(strategy, use_fused_kernels):
     _validate_score_centering_config(
         _config(
             **{
@@ -195,13 +195,6 @@ def test_score_centering_config_skips_checks_when_off():
                 "actor_rollout_ref.model.use_remove_padding": False,
             },
             "use_remove_padding=True",
-        ),
-        (
-            {
-                "actor_rollout_ref.actor.strategy": "megatron",
-                "actor_rollout_ref.model.use_fused_kernels": True,
-            },
-            "use_fused_kernels=True",
         ),
         ({"actor_rollout_ref.actor.pad_to_length": True}, "pad_to_length"),
         ({"actor_rollout_ref.actor.fsdp_config.pad_to_length": True}, "pad_to_length"),

@@ -81,13 +81,16 @@ def get_fused_impl_backend(model: torch.nn.Module) -> str:
     return getattr(model, _FUSED_IMPL_BACKEND_ATTR, "triton")
 
 
-def _gather_fused_hidden_states(hidden_states: Tensor, sequence_parallel: bool, impl_backend: str) -> Tensor:
+def _gather_fused_hidden_states(
+    hidden_states: Tensor, sequence_parallel: bool, impl_backend: str, *, has_topk: bool = False
+) -> Tensor:
     if not sequence_parallel:
         return hidden_states
 
-    # Liger TP-FLSCE already reduces dHidden across vocabulary shards. Its
-    # sequence-parallel gather must only split that gradient in backward.
-    tensor_parallel_output_grad = impl_backend.lower() != "liger"
+    # Liger TP-FLSCE and chunked top-k score centering already reduce dHidden across
+    # vocabulary shards, so their sequence-parallel gather must only split that
+    # gradient in backward instead of reducing it a second time.
+    tensor_parallel_output_grad = impl_backend.lower() != "liger" and not has_topk
     return gather_from_sequence_parallel_region(
         hidden_states,
         tensor_parallel_output_grad=tensor_parallel_output_grad,
@@ -100,6 +103,7 @@ class FusedOutputProcessorContext:
 
     temperature: float
     impl_backend: str = "triton"
+    topk_ids: Optional[Tensor] = None
 
 
 def fused_output_processor(
@@ -126,8 +130,11 @@ def fused_output_processor(
     weight = output_weight if output_weight is not None else output_layer.weight
 
     temperature = context.temperature
-    hidden_states = _gather_fused_hidden_states(hidden_states, config.sequence_parallel, context.impl_backend)
-    logprobs, entropy = linear_cross_entropy(
+    topk_ids = getattr(context, "topk_ids", None)
+    hidden_states = _gather_fused_hidden_states(
+        hidden_states, config.sequence_parallel, context.impl_backend, has_topk=topk_ids is not None
+    )
+    fused_out = linear_cross_entropy(
         hidden_states,
         weight,
         labels,
@@ -135,7 +142,10 @@ def fused_output_processor(
         "none",
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=context.impl_backend,
+        topk_ids=topk_ids,
     )
+    logprobs, entropy = fused_out[:2]
+    topk_log_probs = fused_out[2] if len(fused_out) == 3 else None
 
     if has_config_logger_enabled(config):
         payload = OrderedDict(
@@ -152,6 +162,7 @@ def fused_output_processor(
 
     output.entropy = entropy
     output.log_probs = logprobs
+    output.topk_log_probs = topk_log_probs
     return output
 
 
@@ -284,6 +295,9 @@ def fused_forward_model_engine(vision_model: bool = False):
         router_padding_mask: Tensor | None = None,
         pad_to_length_bucket: int | None = None,
         position_ids: Tensor | None = None,
+        score_centering: bool = False,
+        logits_processor_func=None,
+        batch=None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
@@ -335,6 +349,18 @@ def fused_forward_model_engine(vision_model: bool = False):
             local_cp_size=local_cp_size,
         )
         labels_rmpad = labels_rmpad.contiguous()
+        topk_ids_rmpad = None
+        if score_centering and post_process:
+            if batch is None or logits_processor_func is None:
+                raise ValueError("Megatron fused score centering requires batch and logits_processor_func")
+            topk_ids_rmpad, _, _ = preprocess_thd_engine(
+                batch["rollout_topk_ids"],
+                pre_process=True,
+                need_roll=False,
+                **thd_kwargs,
+            )
+            topk_ids_rmpad = topk_ids_rmpad.contiguous()
+
         forward_kwargs = dict(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
@@ -351,6 +377,7 @@ def fused_forward_model_engine(vision_model: bool = False):
                 output_processor_context=FusedOutputProcessorContext(
                     temperature=temperature,
                     impl_backend=impl_backend,
+                    topk_ids=topk_ids_rmpad,
                 ),
             )
         else:
@@ -358,6 +385,7 @@ def fused_forward_model_engine(vision_model: bool = False):
             output_orig: CausalLMOutputForPPO = model(
                 temperature=temperature,
                 impl_backend=impl_backend,
+                topk_ids=topk_ids_rmpad,
                 **forward_kwargs,
             )
 
@@ -394,6 +422,36 @@ def fused_forward_model_engine(vision_model: bool = False):
             )
             output["entropy"] = entropy
 
+        if score_centering:
+            head_log_probs = getattr(output_orig, "topk_log_probs", None)
+            if head_log_probs is None:
+                raise RuntimeError(
+                    "Megatron fused score centering did not produce topk_log_probs: verify that the model ran "
+                    "linear_cross_entropy with topk_ids on the post_process stage."
+                )
+            sc_outputs = logits_processor_func(
+                student_logits=None,
+                train_head_log_probs=head_log_probs,
+                data=batch,
+                data_format="thd",
+                quant_align_size=quant_align_size,
+                min_local_rows=min_local_rows,
+                cp_layout=cp_layout,
+                local_cp_size=local_cp_size,
+            )
+            for k, v in sc_outputs.items():
+                if v.dim() == 1:
+                    v = v.unsqueeze(0)
+                output[k] = postprocess_thd_engine(
+                    v,
+                    packed_seq_params,
+                    input_ids,
+                    input_ids.shape[0],
+                    post_process=post_process,
+                    cp_layout=cp_layout,
+                    local_cp_size=local_cp_size,
+                )
+
         return output
 
     return fused_forward_model_engine_inner
@@ -416,6 +474,7 @@ def _fused_GPTModel_forward(
     temperature: float = 1.0,
     impl_backend: str = "triton",
     padding_mask: Tensor | None = None,
+    topk_ids: Optional[Tensor] = None,
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
@@ -477,7 +536,9 @@ def _fused_GPTModel_forward(
         attentions=None,
     )
 
-    hidden_states = _gather_fused_hidden_states(hidden_states, model.config.sequence_parallel, impl_backend)
+    hidden_states = _gather_fused_hidden_states(
+        hidden_states, model.config.sequence_parallel, impl_backend, has_topk=topk_ids is not None
+    )
 
     # Get the output weight - use embedding weight if output_layer is None or weight is shared
     if hasattr(model, "output_layer") and model.output_layer is not None and model.output_layer.weight is not None:
@@ -486,7 +547,7 @@ def _fused_GPTModel_forward(
         # When embeddings are tied, use the embedding weight
         output_weight = model.embedding.word_embeddings.weight
 
-    logprobs, entropy = linear_cross_entropy(
+    fused_out = linear_cross_entropy(
         hidden_states,
         output_weight,
         labels,
@@ -494,7 +555,10 @@ def _fused_GPTModel_forward(
         "none",
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=impl_backend,
+        topk_ids=topk_ids,
     )
+    logprobs, entropy = fused_out[:2]
+    topk_log_probs = fused_out[2] if len(fused_out) == 3 else None
 
     if has_config_logger_enabled(model.config):
         payload = OrderedDict(
@@ -511,5 +575,6 @@ def _fused_GPTModel_forward(
 
     output.entropy = entropy
     output.log_probs = logprobs
+    output.topk_log_probs = topk_log_probs
 
     return output

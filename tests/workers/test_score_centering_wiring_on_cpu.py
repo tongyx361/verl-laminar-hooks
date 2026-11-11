@@ -14,12 +14,18 @@
 
 """CPU coverage for score centering's FSDP and Megatron engine wiring."""
 
+import socket
+import sys
+import types
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from tensordict import TensorDict
 
 import verl.utils.torch_functional as verl_F
@@ -318,3 +324,335 @@ def test_fsdp_fused_score_centering_matches_eager_across_backends(
         torch.testing.assert_close(torch.as_tensor(v_fused), torch.as_tensor(v_eager), atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(model_fused.embed.weight.grad, model_eager.embed.weight.grad, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(model_fused.lm_head.weight.grad, model_eager.lm_head.weight.grad, atol=1e-5, rtol=1e-5)
+
+
+def _install_megatron_stubs():
+    """Install lightweight CPU stubs when megatron-core is not installed in the unit-test environment."""
+    if "megatron.core" in sys.modules:
+        return
+
+    @dataclass
+    class _PackedSeqParams:
+        qkv_format: str = "thd"
+        cu_seqlens_q: torch.Tensor = None
+        max_seqlen_q: int = 0
+        cu_seqlens_kv: torch.Tensor = None
+        max_seqlen_kv: int = 0
+        cu_seqlens_q_padded: torch.Tensor = None
+        cu_seqlens_kv_padded: torch.Tensor = None
+        cp_partition_mode: str = "zigzag"
+        local_cp_size: int = None
+        cp_group: object = None
+
+    class _GPTModel(torch.nn.Module):
+        pass
+
+    megatron_pkg = types.ModuleType("megatron")
+    mcore = types.ModuleType("megatron.core")
+    mcore.__version__ = "0.18.0"
+
+    parallel_state = types.ModuleType("megatron.core.parallel_state")
+    parallel_state.get_tensor_model_parallel_group = lambda: None
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+    parallel_state.get_tensor_model_parallel_rank = lambda: 0
+    parallel_state.get_context_parallel_world_size = lambda: 1
+    parallel_state.get_context_parallel_rank = lambda: 0
+    parallel_state.get_context_parallel_group = lambda: None
+    parallel_state.get_expert_tensor_and_model_parallel_group = lambda: None
+
+    config_logger = types.ModuleType("megatron.core.config_logger")
+    config_logger.has_config_logger_enabled = lambda cfg: False
+    config_logger.log_config_to_disk = lambda *a, **kw: None
+
+    inference_pkg = types.ModuleType("megatron.core.inference")
+    inference_ctx = types.ModuleType("megatron.core.inference.contexts")
+    inference_ctx.BaseInferenceContext = object
+
+    models_pkg = types.ModuleType("megatron.core.models")
+    gpt_pkg = types.ModuleType("megatron.core.models.gpt")
+    gpt_model_mod = types.ModuleType("megatron.core.models.gpt.gpt_model")
+    gpt_model_mod.GPTModel = _GPTModel
+
+    packed_mod = types.ModuleType("megatron.core.packed_seq_params")
+    packed_mod.PackedSeqParams = _PackedSeqParams
+
+    tp_pkg = types.ModuleType("megatron.core.tensor_parallel")
+    tp_mappings = types.ModuleType("megatron.core.tensor_parallel.mappings")
+    tp_mappings.gather_from_sequence_parallel_region = lambda x, tensor_parallel_output_grad=True: x
+
+    utils_mod = types.ModuleType("megatron.core.utils")
+    utils_mod.deprecate_inference_params = lambda ctx, params: ctx if ctx is not None else params
+
+    mcore.parallel_state = parallel_state
+    megatron_pkg.core = mcore
+
+    for name, mod in {
+        "megatron": megatron_pkg,
+        "megatron.core": mcore,
+        "megatron.core.parallel_state": parallel_state,
+        "megatron.core.config_logger": config_logger,
+        "megatron.core.inference": inference_pkg,
+        "megatron.core.inference.contexts": inference_ctx,
+        "megatron.core.models": models_pkg,
+        "megatron.core.models.gpt": gpt_pkg,
+        "megatron.core.models.gpt.gpt_model": gpt_model_mod,
+        "megatron.core.packed_seq_params": packed_mod,
+        "megatron.core.tensor_parallel": tp_pkg,
+        "megatron.core.tensor_parallel.mappings": tp_mappings,
+        "megatron.core.utils": utils_mod,
+    }.items():
+        sys.modules.setdefault(name, mod)
+
+    sys.modules.setdefault("verl.utils.megatron_utils", SimpleNamespace(unwrap_model=lambda m: m))
+    patch_mod = types.ModuleType("verl.models.mcore.patch")
+    patch_mod.apply_patch_megatron_v012_with_torch_v28_v29 = lambda: None
+    patch_mod.neutralize_broken_flash_attn_cute = lambda: None
+    sys.modules.setdefault("verl.models.mcore.patch", patch_mod)
+
+
+def _import_mcore_modules():
+    _install_megatron_stubs()
+    from verl.models.mcore import model_forward as mf
+    from verl.models.mcore import model_forward_fused as mff
+
+    return mf, mff
+
+
+def _megatron_actor_config(rollout_is, rollout_is_threshold=2.0):
+    rc = {
+        "bypass_mode": True,
+        "loss_type": "reinforce",
+        "rollout_is": rollout_is,
+        "rollout_is_threshold": rollout_is_threshold,
+        "score_centering": True,
+    }
+    return ActorConfig(
+        strategy="megatron",
+        rollout_n=1,
+        ppo_mini_batch_size=2,
+        ppo_micro_batch_size_per_gpu=2,
+        use_dynamic_bsz=False,
+        policy_loss=PolicyLossConfig(loss_mode="bypass_mode", rollout_correction=rc),
+    )
+
+
+class _TinyMegatronHookModel(torch.nn.Module):
+    """Minimal Megatron GPTModel supporting both native output_processor hook and eager logits."""
+
+    def __init__(self, vocab_size: int, hidden_dim: int, weight_shard: torch.Tensor = None):
+        super().__init__()
+        self.pre_process = True
+        self.post_process = True
+        self.config = SimpleNamespace(sequence_parallel=False, fp8=None, fp4=None)
+        self.embed = torch.nn.Embedding(vocab_size, hidden_dim)
+        if weight_shard is None:
+            self.output_layer = torch.nn.Linear(hidden_dim, vocab_size, bias=False)
+        else:
+            self.output_layer = SimpleNamespace(weight=weight_shard)
+        self._verl_fused_forward_mode = "hook"
+        self._verl_fused_impl_backend = "triton"
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+        labels=None,
+        output_processor=None,
+        output_processor_context=None,
+        **kwargs,
+    ):
+        hidden = self.embed(input_ids)
+        if output_processor is not None:
+            return output_processor(
+                hidden_states=hidden,
+                output_layer=self.output_layer,
+                output_weight=None,
+                labels=labels,
+                context=output_processor_context,
+                config=self.config,
+            )
+        return hidden @ self.output_layer.weight.t()
+
+
+@pytest.mark.parametrize("fused_mode", ["hook", "legacy"])
+@pytest.mark.parametrize(
+    "rollout_is, threshold",
+    [
+        (None, 2.0),  # SC
+        ("token", 2.0),  # SC + TIS
+        ("token", "0.5_5.0"),  # SC + MIS
+    ],
+)
+@pytest.mark.parametrize("support_complete", [False, True])
+def test_megatron_fused_score_centering_matches_eager(fused_mode, rollout_is, threshold, support_complete):
+    mf, mff = _import_mcore_modules()
+    vocab_size, hidden_dim = 24, 12
+
+    torch.manual_seed(41)
+    model_fused = _TinyMegatronHookModel(vocab_size, hidden_dim)
+    model_eager = _TinyMegatronHookModel(vocab_size, hidden_dim)
+    model_eager.load_state_dict(model_fused.state_dict())
+    if fused_mode == "legacy":
+        model_fused._verl_fused_forward_mode = "legacy"
+        model_fused._preprocess = lambda input_ids, **kw: (model_fused.embed(input_ids), None, None, None, None)
+        model_fused.decoder = lambda hidden_states, **kw: hidden_states
+        model_fused.forward = mff._fused_GPTModel_forward.__get__(model_fused, model_fused.__class__)
+
+    actor_cfg = _megatron_actor_config(rollout_is, threshold)
+    loss_fn = partial(score_centering_ppo_loss, config=actor_cfg)
+    batch = _build_ragged_micro_batch(vocab_size=vocab_size, k=4, support_complete=support_complete)
+
+    out_fused = mff.fused_forward_model_engine(vision_model=False)(
+        model=model_fused,
+        input_ids=batch["input_ids"],
+        labels=batch["input_ids"].clone(),
+        multi_modal_inputs={},
+        temperature=0.8,
+        calculate_entropy=True,
+        pad_token_id=0,
+        score_centering=True,
+        logits_processor_func=loss_fn,
+        batch=batch,
+    )
+    loss_fused, metrics_fused = loss_fn(model_output=out_fused, data=batch, dp_group=None)
+    loss_fused.backward()
+
+    def eager_logits_processor(logits, label, temperature):
+        scaled = logits / temperature.unsqueeze(-1)
+        probs = torch.softmax(scaled.float(), dim=-1)
+        logp = torch.log_softmax(scaled.float(), dim=-1)
+        ret = {
+            "entropy": -(probs * logp).sum(dim=-1),
+            "log_probs": logp.gather(-1, label.unsqueeze(-1)).squeeze(-1),
+        }
+        ret.update(loss_fn(student_logits=scaled, data=batch, data_format="thd"))
+        return ret
+
+    temp_nested = torch.nested.as_nested_tensor(
+        [torch.full((len(s),), 0.8) for s in batch["input_ids"].unbind()], layout=torch.jagged
+    )
+    out_eager = mf.gptmodel_forward_model_engine(
+        model=model_eager,
+        input_ids=batch["input_ids"],
+        multi_modal_inputs={},
+        logits_processor=eager_logits_processor,
+        logits_processor_args={"label": batch["input_ids"].clone(), "temperature": temp_nested},
+        data_format="thd",
+    )
+    loss_eager, metrics_eager = loss_fn(model_output=out_eager, data=batch, dp_group=None)
+    loss_eager.backward()
+
+    torch.testing.assert_close(loss_fused.detach(), loss_eager.detach(), atol=1e-5, rtol=1e-5)
+    for key in (
+        "actor/sc_correction",
+        "actor/sc_sampler_head_mass",
+        "actor/sc_train_head_mass",
+        "actor/sc_support_aligned",
+        "actor/sc_sampler_tail_mass",
+    ):
+        v_f = metrics_fused[key].aggregate() if hasattr(metrics_fused[key], "aggregate") else metrics_fused[key]
+        v_e = metrics_eager[key].aggregate() if hasattr(metrics_eager[key], "aggregate") else metrics_eager[key]
+        torch.testing.assert_close(torch.as_tensor(v_f), torch.as_tensor(v_e), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(model_fused.embed.weight.grad, model_eager.embed.weight.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        model_fused.output_layer.weight.grad, model_eager.output_layer.weight.grad, atol=1e-5, rtol=1e-5
+    )
+
+
+def _tp2_megatron_worker(rank: int, world_size: int, port: int, state_dict: dict, queue):
+    _, mff = _import_mcore_modules()
+    from verl.models.mcore import util as mcore_util
+
+    dist.init_process_group(backend="gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size)
+    try:
+        mff.parallel_state.get_tensor_model_parallel_group = lambda: dist.group.WORLD
+        mff.parallel_state.get_tensor_model_parallel_world_size = lambda: world_size
+        mff.parallel_state.get_tensor_model_parallel_rank = lambda: rank
+        mcore_util.mpu.get_tensor_model_parallel_world_size = lambda: world_size
+        sys.modules["megatron.core.parallel_state"].get_tensor_model_parallel_group = lambda: dist.group.WORLD
+        sys.modules["megatron.core.parallel_state"].get_tensor_model_parallel_world_size = lambda: world_size
+
+        vocab_size, hidden_dim = 24, 12
+        local_vocab = vocab_size // world_size
+        full_out_weight = state_dict["output_layer.weight"]
+        shard_weight = torch.nn.Parameter(full_out_weight[rank * local_vocab : (rank + 1) * local_vocab].clone())
+
+        model = _TinyMegatronHookModel(vocab_size, hidden_dim, weight_shard=shard_weight)
+        model.embed.weight.data.copy_(state_dict["embed.weight"])
+
+        batch = _build_ragged_micro_batch(vocab_size=vocab_size, k=4, support_complete=False)
+        loss_fn = partial(score_centering_ppo_loss, config=_megatron_actor_config("token", 2.0))
+        out = mff.fused_forward_model_engine(vision_model=False)(
+            model=model,
+            input_ids=batch["input_ids"],
+            labels=batch["input_ids"].clone(),
+            multi_modal_inputs={},
+            temperature=0.8,
+            calculate_entropy=True,
+            pad_token_id=0,
+            score_centering=True,
+            logits_processor_func=loss_fn,
+            batch=batch,
+        )
+        loss, _ = loss_fn(model_output=out, data=batch, dp_group=None)
+        loss.backward()
+        queue.put((rank, float(loss.detach()), model.embed.weight.grad.tolist(), shard_weight.grad.tolist()))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_megatron_fused_score_centering_tp2_vocab_parallel_matches_tp1():
+    _, mff = _import_mcore_modules()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    vocab_size, hidden_dim = 24, 12
+    torch.manual_seed(53)
+    ref_model = _TinyMegatronHookModel(vocab_size, hidden_dim)
+    state_dict = {k: v.detach().clone() for k, v in ref_model.state_dict().items()}
+
+    batch = _build_ragged_micro_batch(vocab_size=vocab_size, k=4, support_complete=False)
+    loss_fn = partial(score_centering_ppo_loss, config=_megatron_actor_config("token", 2.0))
+    out_tp1 = mff.fused_forward_model_engine(vision_model=False)(
+        model=ref_model,
+        input_ids=batch["input_ids"],
+        labels=batch["input_ids"].clone(),
+        multi_modal_inputs={},
+        temperature=0.8,
+        calculate_entropy=True,
+        pad_token_id=0,
+        score_centering=True,
+        logits_processor_func=loss_fn,
+        batch=batch,
+    )
+    loss_tp1, _ = loss_fn(model_output=out_tp1, data=batch, dp_group=None)
+    loss_tp1.backward()
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    mp.spawn(_tp2_megatron_worker, args=(2, port, state_dict, queue), nprocs=2, join=True)
+    items = sorted((queue.get(timeout=5) for _ in range(2)), key=lambda x: x[0])
+
+    for _, loss_tp2, embed_grad_tp2, _ in items:
+        torch.testing.assert_close(torch.tensor(loss_tp2), loss_tp1.detach(), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(torch.tensor(embed_grad_tp2), ref_model.embed.weight.grad, atol=1e-5, rtol=1e-5)
+    out_grad_tp2 = torch.cat([torch.tensor(item[3]) for item in items], dim=0)
+    torch.testing.assert_close(out_grad_tp2, ref_model.output_layer.weight.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_gather_fused_hidden_states_disables_tp_grad_reduce_when_has_topk(monkeypatch):
+    _, mff = _import_mcore_modules()
+    seen = []
+
+    def fake_gather(hidden, tensor_parallel_output_grad=True):
+        seen.append(tensor_parallel_output_grad)
+        return hidden
+
+    monkeypatch.setattr(mff, "gather_from_sequence_parallel_region", fake_gather)
+    hidden = torch.randn(4, 8)
+    mff._gather_fused_hidden_states(hidden, sequence_parallel=True, impl_backend="triton", has_topk=False)
+    mff._gather_fused_hidden_states(hidden, sequence_parallel=True, impl_backend="triton", has_topk=True)
+    assert seen == [True, False]

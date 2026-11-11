@@ -119,13 +119,10 @@ def _validate_score_centering_config(config: DictConfig) -> None:
             "score centering with actor_rollout_ref.model.use_fused_kernels=True requires "
             "actor_rollout_ref.model.use_remove_padding=True."
         )
-    if strategy == "megatron":
-        if not use_remove_padding:
-            raise ValueError(
-                "score centering on megatron requires actor_rollout_ref.model.use_remove_padding=True (thd format)."
-            )
-        if use_fused:
-            raise ValueError("score centering on megatron does not support use_fused_kernels=True.")
+    if strategy == "megatron" and not use_remove_padding:
+        raise ValueError(
+            "score centering on megatron requires actor_rollout_ref.model.use_remove_padding=True (thd format)."
+        )
     fsdp_cfg = actor_cfg.get("fsdp_config") or {}
     megatron_cfg = actor_cfg.get("megatron") or {}
     veomni_cfg = actor_cfg.get("veomni") or {}
