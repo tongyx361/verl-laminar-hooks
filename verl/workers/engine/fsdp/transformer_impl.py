@@ -76,6 +76,7 @@ from verl.workers.utils.padding import build_attention_mask_from_nested
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import (
     detach_tree,
+    enable_batch_invariance,
     enable_full_determinism,
     pad_packed_inputs,
     postprocess_batch_func,
@@ -137,9 +138,11 @@ class FSDPEngine(BaseEngine):
         self.rank = torch.distributed.get_rank()
 
         # Apply NPU patches for FSDP backend
-        from .utils import apply_npu_fsdp_patches
+        skip_npu_patches = getattr(self.engine_config, "strategy", None) == "fsdp_turbo"
+        if not skip_npu_patches:
+            from .utils import apply_npu_fsdp_patches
 
-        apply_npu_fsdp_patches(self.model_config)
+            apply_npu_fsdp_patches(self.model_config)
 
         # build device mesh for Ulysses Sequence Parallel
 
@@ -153,6 +156,13 @@ class FSDPEngine(BaseEngine):
 
         self._init_device_mesh()
 
+        if self.engine_config.batch_invariant:
+            if self.model_config.use_fused_kernels:
+                raise ValueError(
+                    "batch_invariant does not support use_fused_kernels: the fused kernel computes its own log-probs"
+                )
+            enable_batch_invariance()
+        # full_determinism runs last so its env settings win over batch invariance
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
@@ -168,12 +178,6 @@ class FSDPEngine(BaseEngine):
         # defaults so forward_step / optimizer_step can still read them safely.
         self._autocast_dtype = torch.bfloat16
         self.scaler = None
-
-        # QAT (Quantization-Aware Training)
-        self._qat_config = getattr(self.engine_config, "qat", None)
-        self._qat_enabled = self._qat_config is not None and getattr(self._qat_config, "enable", False)
-        if self._qat_enabled:
-            logger.info(f"QAT enabled: mode={self._qat_config.mode}, group_size={self._qat_config.group_size}")
 
         if self.engine_config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
@@ -224,8 +228,6 @@ class FSDPEngine(BaseEngine):
             per_tensor_param_fn=self._get_hf_export_per_tensor_param,
             hf_export_dtype=self._autocast_dtype,
         )
-        if self._qat_enabled and self.checkpoint_manager.should_save_hf_model:
-            raise NotImplementedError("Saving 'hf_model' in checkpoints is not supported with QAT enabled.")
 
         self.to(
             device="cpu",
@@ -537,58 +539,6 @@ class FSDPEngine(BaseEngine):
             raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
         return lr_scheduler
 
-    def _apply_qat(self, module):
-        """Apply QAT transformations to the model before FSDP wrapping."""
-        from verl.utils.qat.core import apply_qat, enable_qat_fuse
-
-        module = apply_qat(
-            module,
-            {
-                "enable": self._qat_config.enable,
-                "mode": self._qat_config.mode,
-                "group_size": self._qat_config.group_size,
-                "ignore_patterns": list(self._qat_config.ignore_patterns),
-                "activation_observer": self._qat_config.activation_observer,
-            },
-        )
-        enable_qat_fuse(module)
-
-        if self._qat_config.mode == "w4a4":
-            self._restore_w4a4_input_scales(module, self.model_config.local_path)
-
-        return module
-
-    def _restore_w4a4_input_scales(self, model, model_path):
-        """Restore input_global_scale and input_amax from checkpoint for W4A4 mode."""
-        import glob
-
-        from safetensors import safe_open
-
-        safetensor_files = glob.glob(f"{model_path}/model*.safetensors")
-        loaded_count = 0
-
-        for sf_path in safetensor_files:
-            with safe_open(sf_path, framework="pt") as f:
-                for key in f.keys():
-                    if "input_global_scale" in key:
-                        module_path = key.replace(".input_global_scale", "")
-                        amax_key = f"{module_path}.input_amax"
-
-                        module = model
-                        for part in module_path.split("."):
-                            module = module[int(part)] if part.isdigit() else getattr(module, part)
-
-                        scale_val = f.get_tensor(key)
-                        val = scale_val.item() if scale_val.numel() == 1 else scale_val.max().item()
-                        module.input_global_scale.fill_(val)
-
-                        amax_val = f.get_tensor(amax_key)
-                        amax = amax_val.item() if amax_val.numel() == 1 else amax_val.max().item()
-                        module.input_amax.fill_(amax)
-                        loaded_count += 1
-
-        logger.info(f"[QAT W4A4] Restored {loaded_count} input_global_scale/input_amax from {model_path}")
-
     def _build_model_optimizer(self):
         from verl.utils.model import print_model_size
 
@@ -601,10 +551,6 @@ class FSDPEngine(BaseEngine):
         # Apply LoRA adapters if low-rank adaptation is enabled
         if self._is_lora:
             module = self._build_lora_module(module)
-
-        # Apply QAT before FSDP wrapping (training only)
-        if self._qat_enabled and not self.engine_config.forward_only:
-            module = self._apply_qat(module)
 
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
@@ -830,11 +776,6 @@ class FSDPEngine(BaseEngine):
             else:
                 self.optimizer.step()
 
-        if self._qat_enabled:
-            from verl.utils.qat.core import invalidate_all_scales
-
-            invalidate_all_scales(self.module)
-
         return grad_norm.item()
 
     def lr_scheduler_step(self):
@@ -1038,28 +979,6 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items()
             )
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
-
-        if self._qat_enabled:
-            from verl.utils.qat.quantizer import QATQuantizer
-            from verl.utils.torch_dtypes import PrecisionType
-
-            mixed_precision_config = self.engine_config.mixed_precision
-            if mixed_precision_config is not None:
-                param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
-            else:
-                param_dtype = torch.bfloat16
-
-            quantizer = QATQuantizer(
-                mode=self._qat_config.mode,
-                group_size=self._qat_config.group_size,
-                ignore_patterns=list(self._qat_config.ignore_patterns),
-                device=torch.device(get_device_id()),
-                param_dtype=param_dtype,
-            )
-            per_tensor_param = quantizer.quantize_with_fusion(
-                per_tensor_param,
-                target_device=torch.device("cpu"),
-            )
 
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
@@ -1370,6 +1289,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # through prepare_model_inputs. Without the optimization metadata, fall
         # back to the original out-of-place scaling path.
         temperature_is_one = output_args.get("temperature_is_one", False)
+        batch_invariant = self.engine_config.batch_invariant
 
         input_ids = micro_batch["input_ids"]
 
@@ -1401,6 +1321,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits_rmpad, DTensor):
                     logits_rmpad = logits_rmpad.full_tensor()
+                # the vLLM sampler divides the fp32 logits by the temperature, so the sampler path takes them unscaled
+                unscaled_logits_rmpad = logits_rmpad
                 logits_rmpad = _scale_logits_by_temperature(
                     logits_rmpad,
                     temperature_rmpad.unsqueeze(-1),
@@ -1443,9 +1365,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # entropy and the score centering hook reuse the logits in their backward
                     inplace_backward = not (calculate_entropy or score_centering)
                     log_probs = logprobs_from_logits(
-                        logits=logits_rmpad,
+                        logits=unscaled_logits_rmpad if batch_invariant else logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
+                        batch_invariant=batch_invariant,
+                        temperature=None if temperature_is_one else temperature_rmpad,
                     )
 
             # gather across the ulysses sp group and drop the packed-sequence padding
@@ -1497,6 +1421,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits, DTensor):
                     logits = logits.full_tensor()
+                unscaled_logits = logits
                 logits = _scale_logits_by_temperature(
                     logits,
                     temperature,
@@ -1518,6 +1443,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                     logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
                     logits_rmpad = torch.cat([t for t in logits.unbind()])
+                    if batch_invariant:
+                        if temperature_is_one:
+                            unscaled_logits_rmpad = logits_rmpad
+                        else:
+                            unscaled_logits = torch.nested.narrow(
+                                unscaled_logits, 1, starts, seq_lengths, layout=torch.jagged
+                            )
+                            unscaled_logits_rmpad = torch.cat([t for t in unscaled_logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
 
                     # Mirror the use_remove_padding=True branch (see verl#6293).
@@ -1537,9 +1470,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     log_probs = None
                     if not distillation_only:
                         log_probs = logprobs_from_logits(
-                            logits=logits_rmpad,
+                            logits=unscaled_logits_rmpad if batch_invariant else logits_rmpad,
                             labels=input_ids_rmpad_rolled,
                             inplace_backward=not score_centering,
+                            batch_invariant=batch_invariant,
+                            temperature=None
+                            if temperature_is_one
+                            else temperature.flatten().repeat_interleave(seq_lengths),
                         )
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
