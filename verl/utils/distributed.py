@@ -80,7 +80,7 @@ def destroy_global_process_group():
         torch.distributed.destroy_process_group()
 
 
-def initialize_global_process_group_ray(timeout_second=None, backend=None):
+def initialize_global_process_group_ray(timeout_second=None, backend=None, store=None):
     # in current ray environment, LOCAL_RANK is always zero.
 
     import torch.distributed
@@ -95,7 +95,7 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
             rank=rank,
             world_size=world_size,
             timeout=timeout,
-            init_method=os.environ.get("DIST_INIT_METHOD", None),
+            **({"store": store} if store is not None else {"init_method": os.environ.get("DIST_INIT_METHOD", None)}),
         )
 
 

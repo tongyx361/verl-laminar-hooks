@@ -20,6 +20,7 @@ from typing import Any, AsyncGenerator, Generator
 
 import ray
 import torch
+from torch.distributed.constants import default_pg_timeout
 
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -316,6 +317,8 @@ class CheckpointEngineWorker(Worker):
         rollout_config: The rollout configuration.
         model_config: The model configuration.
         server_adapter: The server adapter to update weights.
+        defer_process_group_init: Let RolloutReplica initialize the CPU group
+            after all actors have been created and before launching servers.
     """
 
     def __init__(
@@ -324,6 +327,7 @@ class CheckpointEngineWorker(Worker):
         model_config: HFModelConfig,
         server_adapter: BaseRollout = None,
         *args,
+        defer_process_group_init: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -355,8 +359,37 @@ class CheckpointEngineWorker(Worker):
                 device_mesh=None,
                 **self.extra_rollout_kwargs,
             )
-        # sglang and trt-llm need device_mesh for internal communication
-        initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
+        self._process_group_store = None
+        # Replica-owned workers initialize together before launch_servers. Direct
+        # callers keep the existing constructor initialization contract.
+        if not defer_process_group_init:
+            initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
+
+    def create_process_group_store(self) -> tuple[str, int]:
+        """Bind and retain the rendezvous server in the actual rank-zero actor."""
+        assert self._rank == 0
+        address = ray.util.get_node_ip_address().strip("[]")
+        self._process_group_store = torch.distributed.TCPStore(
+            host_name=address,
+            port=0,
+            world_size=self._world_size,
+            is_master=True,
+            timeout=default_pg_timeout,
+            wait_for_workers=False,
+        )
+        return address, self._process_group_store.port
+
+    def initialize_process_group(self, master_address: str, master_port: int):
+        """Join the rank-zero store without releasing or rebinding its port."""
+        if self._rank != 0:
+            self._process_group_store = torch.distributed.TCPStore(
+                host_name=master_address,
+                port=master_port,
+                world_size=self._world_size,
+                is_master=False,
+                timeout=default_pg_timeout,
+            )
+        initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo", store=self._process_group_store)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):

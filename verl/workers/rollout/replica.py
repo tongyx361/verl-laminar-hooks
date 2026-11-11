@@ -179,6 +179,7 @@ class RolloutReplica(ABC):
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
+        await self._initialize_process_group()
         await self.launch_servers()
 
     async def init_standalone(self, resource_pool: Optional[RayResourcePool] = None):
@@ -228,7 +229,14 @@ class RolloutReplica(ABC):
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
+        await self._initialize_process_group()
         await self.launch_servers()
+
+    async def _initialize_process_group(self):
+        # The rank-zero actor owns the bound TCPStore throughout initialization
+        # and subsequent CPU collectives; no free-port handoff is involved.
+        address, port = await self.workers[0].create_process_group_store.remote()
+        await asyncio.gather(*[worker.initialize_process_group.remote(address, port) for worker in self.workers])
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         """Get rollout worker actor class for colocated and standalone mode."""
@@ -241,6 +249,7 @@ class RolloutReplica(ABC):
             rollout_config=self.config,
             model_config=self.model_config,
             replica_rank=self.replica_rank,
+            defer_process_group_init=True,
         )
 
     @abstractmethod
