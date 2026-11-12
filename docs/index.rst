@@ -49,6 +49,7 @@ verl is fast with:
 
    preparation/prepare_data
    preparation/reward_function
+   data/aime_exam_splits
 
 .. toctree::
    :maxdepth: 2
@@ -158,7 +159,6 @@ verl is fast with:
    advance/agent_loop
    advance/reward_loop
    data/transfer_queue.md
-   data/aime_exam_splits
    advance/grafana_prometheus.md
    advance/mtp.md
    advance/determinism.md

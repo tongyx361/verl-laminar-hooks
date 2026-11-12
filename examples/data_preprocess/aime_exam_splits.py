@@ -121,6 +121,12 @@ def write_parquet(rows, path):
 
 
 BOXED_SUFFIX = "\n\nLet's think step by step and output the final answer within \\boxed{}."
+DAPO_ANSWER_PREFIX = (
+    "Solve the following math problem step by step. The last line of your response should be of the form "
+    "Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
+)
+DAPO_ANSWER_SUFFIX = '\n\nRemember to put your answer on its own line after "Answer:".'
+PROMPT_FORMATS = ("boxed", "dapo_answer", "clean")
 YEARS = (2024, 2025, 2026)
 SESSIONS = ("I", "II")
 FILENAME = "data/train-00000-of-00001.parquet"
@@ -274,8 +280,21 @@ def verify_membership(sources):
                     raise ValueError(f"Publisher session problem disagrees: {key}/{ref['problem_idx']}")
 
 
-def prepare_validation(sources, existing=None):
+def format_aime_prompt(problem: str, prompt_format: str = "boxed") -> str:
+    """Wrap unmodified mathematical source text with the requested instruction format."""
+    if prompt_format == "boxed":
+        return problem + BOXED_SUFFIX
+    if prompt_format == "dapo_answer":
+        return DAPO_ANSWER_PREFIX + problem + DAPO_ANSWER_SUFFIX
+    if prompt_format == "clean":
+        return problem
+    raise ValueError(f"Unsupported prompt_format: {prompt_format!r}")
+
+
+def prepare_validation(sources, existing=None, *, prompt_format="boxed"):
     """Preserve legacy rows and create independently named validation metric groups."""
+    if prompt_format not in PROMPT_FORMATS:
+        raise ValueError(f"Unsupported prompt_format: {prompt_format!r}")
     existing = existing or {}
     verify_membership(sources)
     grouped = {f"aime{year}-{session}": [] for year in YEARS for session in SESSIONS}
@@ -292,11 +311,11 @@ def prepare_validation(sources, existing=None):
             if not isinstance(problem, str) or not problem or any(ord(c) < 32 and c not in "\n\r" for c in problem):
                 raise ValueError(f"Invalid {dataset} mathematical text/control characters")
             index, answer = source_index(raw, year), source_answer(raw, year)
-            prompt = [{"role": "user", "content": problem + BOXED_SUFFIX}]
+            prompt = [{"role": "user", "content": format_aime_prompt(problem, prompt_format)}]
             if old_rows is not None:
                 row = deepcopy(old[index])
                 if row["data_source"] != dataset or row["prompt"] != prompt:
-                    raise ValueError(f"Existing {dataset}/{index} prompt differs from pinned boxed source")
+                    raise ValueError(f"Existing {dataset}/{index} prompt differs from pinned {prompt_format} source")
                 if row["reward_model"] != {"style": "rule", "ground_truth": answer}:
                     raise ValueError(f"Existing {dataset}/{index} ground truth differs from pinned source")
             else:
@@ -327,6 +346,12 @@ def main():
     )
     parser.add_argument("--existing-aime2024", type=Path)
     parser.add_argument("--existing-aime2025", type=Path)
+    parser.add_argument(
+        "--prompt-format",
+        choices=PROMPT_FORMATS,
+        default="boxed",
+        help="Prompt instruction wrapper: 'boxed' (default), 'dapo_answer' ('Answer: $Answer'), or 'clean'.",
+    )
     args = parser.parse_args()
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -346,18 +371,24 @@ def main():
         if path:
             existing[f"aime{year}"] = pq.read_table(path).to_pylist()
             inputs[f"aime{year}"] = {"path": str(path.resolve()), "sha256": digest(path)}
-    grouped = prepare_validation(sources, existing)
+    grouped = prepare_validation(sources, existing, prompt_format=args.prompt_format)
     artifacts = {key: write_parquet(rows, output / f"{key}.parquet") for key, rows in grouped.items()}
+    for year in YEARS:
+        year_key = f"aime{year}"
+        year_rows = grouped[f"{year_key}-I"] + grouped[f"{year_key}-II"]
+        artifacts[year_key] = write_parquet(year_rows, output / f"{year_key}.parquet")
     all_rows = [row for rows in grouped.values() for row in rows]
     artifacts["all"] = write_parquet(all_rows, output / "aime2024-2026.parquet")
     manifest = {
         "schema_version": 1,
         "sources": VALIDATION_SOURCES,
         "preserved_inputs": inputs,
+        "prompt_format": args.prompt_format,
         "prompt_policy": (
-            "Unmodified mathematical source text plus the identical boxed suffix; existing prompts preserved"
+            f"Unmodified mathematical source text formatted with prompt_format={args.prompt_format!r}; "
+            "existing prompts preserved when verified"
         ),
-        "prompt_suffix": BOXED_SUFFIX,
+        "prompt_suffix": BOXED_SUFFIX if args.prompt_format == "boxed" else None,
         "session_verification": {
             "aime2024": "Original H4 URL contains exam and question number; all 30 answers match publisher I/II files",
             "aime2025": "All 30 problem texts and answers match publisher I/II files exactly",

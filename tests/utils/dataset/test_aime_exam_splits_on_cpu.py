@@ -17,6 +17,8 @@ import pytest
 
 from examples.data_preprocess.aime_exam_splits import (
     BOXED_SUFFIX,
+    DAPO_ANSWER_PREFIX,
+    DAPO_ANSWER_SUFFIX,
     SESSIONS,
     YEARS,
     exam_identity,
@@ -202,8 +204,29 @@ def test_offline_cli_manifest_preserves_source_licenses_and_artifact_hashes(sour
     for key, specification in manifest["sources"].items():
         if key != "aime2024":
             assert specification["license"] == "cc-by-nc-sa-4.0"
+    for year in YEARS:
+        assert manifest["artifacts"][f"aime{year}"]["rows"] == 30
+    assert manifest["artifacts"]["all"]["rows"] == 90
     for artifact in manifest["artifacts"].values():
         path = output / Path(artifact["path"]).name
         assert artifact["sha256"] == generator.digest(path)
         assert artifact["bytes"] == path.stat().st_size
         assert pq.read_table(path).num_rows == artifact["rows"]
+
+
+@pytest.mark.parametrize("prompt_format", ["boxed", "dapo_answer", "clean"])
+def test_prompt_format_variants(sources, prompt_format):
+    grouped = prepare_validation(sources, prompt_format=prompt_format)
+    content = grouped["aime2025-I"][0]["prompt"][0]["content"]
+    raw_problem = sources["aime2025"][0]["problem"]
+    if prompt_format == "boxed":
+        assert content == raw_problem + BOXED_SUFFIX
+    elif prompt_format == "dapo_answer":
+        assert content == DAPO_ANSWER_PREFIX + raw_problem + DAPO_ANSWER_SUFFIX
+    else:
+        assert content == raw_problem
+
+
+def test_invalid_prompt_format_is_rejected(sources):
+    with pytest.raises(ValueError, match="Unsupported prompt_format"):
+        prepare_validation(sources, prompt_format="unknown")
